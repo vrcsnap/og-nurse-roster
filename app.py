@@ -48,6 +48,13 @@ DEFAULT_NURSES = [
     {"id": 28, "name": "Kong Tsz Sin Sarah", "cap": "C(Runner)"}
 ]
 
+SHIFT_OPTIONS = {
+    "想放假 Day Off (O)": "O",
+    "想返早班 AM (A)": "A",
+    "想返午班 PM (P)": "P",
+    "想返夜班 Night (N)": "N"
+}
+
 # 初始化 Session 狀態
 if "requests_db" not in st.session_state:
     st.session_state.requests_db = []
@@ -83,15 +90,12 @@ if selected_user not in ["請選擇...", "Admin (Ward Manager)"]:
             default_next_month = (current_month % 12) + 1
             req_month = st.selectbox("月份", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
+            # 修正：提取 index 確保為整數，避免型別衝突
             max_day = calendar.monthrange(req_year, req_month)
-            req_day = st.number_input("日期", min_value=1, max_value=max_day, value=1, key="n_da")
+            req_day = st.number_input("日期", min_value=1, max_value=max_day, value=1, step=1, key="n_da")
             
-        req_shift = st.selectbox("偏好班別：", [
-            "想放假 Day Off (O)",
-            "想返早班 AM (A)",
-            "想返午班 PM (P)",
-            "想返夜班 Night (N)"
-        ])
+        selected_shift_label = st.selectbox("偏好班別：", list(SHIFT_OPTIONS.keys()))
+        shift_code = SHIFT_OPTIONS[selected_shift_label]
         
         req_reason = st.text_input("備註原因 (選填)：", "")
         
@@ -101,20 +105,21 @@ if selected_user not in ["請選擇...", "Admin (Ward Manager)"]:
                 "name": selected_user,
                 "year": req_year,
                 "month": req_month,
-                "day": req_day,
-                "shift": req_shift.split()[0], # O, A, P, N
+                "day": int(req_day),
+                "shift": shift_code,
+                "shift_label": selected_shift_label,
                 "reason": req_reason,
                 "status": "待審核"
             }
             st.session_state.requests_db.append(new_entry)
-            st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {req_shift}！")
+            st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
             
         st.markdown("---")
         st.subheader("您已提交的申請記錄：")
         my_reqs = [r for r in st.session_state.requests_db if r["name"] == selected_user]
         if my_reqs:
             df_my = pd.DataFrame(my_reqs)
-            st.dataframe(df_my[["year", "month", "day", "shift", "reason", "status"]], use_container_width=True)
+            st.dataframe(df_my[["year", "month", "day", "shift_label", "reason", "status"]], use_container_width=True)
             if st.button("撤回我的所有申請"):
                 st.session_state.requests_db = [r for r in st.session_state.requests_db if r["name"] != selected_user]
                 st.rerun()
@@ -155,7 +160,8 @@ elif selected_user == "Admin (Ward Manager)":
             for idx, r in enumerate(curr_reqs):
                 col_a, col_b = st.columns()
                 with col_a:
-                    st.write(f"**{r['name']}** 申請 **{r['month']}/{r['day']}** 返 **{r['shift']}更** (原因: {r['reason']} | 提交時間: {r['timestamp']})")
+                    shift_disp = r.get("shift_label", r["shift"])
+                    st.write(f"**{r['name']}** 申請 **{r['month']}/{r['day']}**：{shift_disp} (原因: {r['reason']} | 提交時間: {r['timestamp']})")
                 with col_b:
                     is_app = st.checkbox("批准", value=True, key=f"app_{idx}")
                     if is_app:
@@ -168,6 +174,7 @@ elif selected_user == "Admin (Ward Manager)":
         
         if st.button("🚀 開始自動排班運算 (Run OR-Tools Solver)"):
             with st.spinner("求解器正在運算四級資歷、連續交接與休假限制，請稍候約 15 秒..."):
+                # 修正：提取 index 確保為整數天數
                 num_days = calendar.monthrange(plan_year, plan_month)
                 first_weekday = datetime.date(plan_year, plan_month, 1).weekday()
                 days = list(range(num_days))
@@ -274,9 +281,12 @@ elif selected_user == "Admin (Ward Manager)":
                 for r in approved_reqs:
                     n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
                     if n_match:
-                        d_idx = r["day"] - 1
+                        d_idx = int(r["day"]) - 1
                         s_target = r["shift"]
-                        model.Add(shift_assigned(n_match['id'], d_idx, s_target) == 1)
+                        if s_target == "O":
+                            model.Add(x[n_match['id'], d_idx, 'O', 'None'] == 1)
+                        else:
+                            model.Add(shift_assigned(n_match['id'], d_idx, s_target) == 1)
 
                 # 目標最佳化
                 scores = [-50 * sum(off_penalties)]
@@ -315,6 +325,7 @@ elif selected_user == "Admin (Ward Manager)":
                     weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
                     headers = ["編號", "資歷能力", "護士姓名"] + [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days] + ["總上班日", "總放假日"]
                     
+                    # 修正：加上 列號索引
                     ws.row_dimensions.height = 28
                     for col_idx, h in enumerate(headers, 1):
                         cell = ws.cell(row=3, column=col_idx, value=h)
