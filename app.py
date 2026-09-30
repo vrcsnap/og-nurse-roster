@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 from ortools.sat.python import cp_model
 import io
 
-# 頁面配置
+# 頁面基本配置
 st.set_page_config(page_title="O&G 產房手術室護士排班系統", layout="wide", page_icon="🏥")
 
 # 常數定義 (0=Mon, ..., 6=Sun)
@@ -73,7 +73,7 @@ selected_user = st.sidebar.selectbox("請選擇使用者身份：", user_options
 # ==========================================
 # 介面分支 A：護士專用操作頁面 (Page 2 - 4)
 # ==========================================
-if selected_user not in ["請選擇...", "Admin (Ward Manager)"]:
+if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
     st.header(f"👋 您好，{selected_user}")
     
     tab1, tab2 = st.tabs(["📝 填寫特別申請 (Make Special Request)", "📅 查看已公佈班表 (See Duty Schedule)"])
@@ -84,14 +84,14 @@ if selected_user not in ["請選擇...", "Admin (Ward Manager)"]:
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            req_year = st.selectbox("年份", [2026, 2027], index=0, key="n_yr")
+            req_year = st.selectbox("年份", (2026, 2027), index=0, key="n_yr")
         with col2:
             current_month = datetime.date.today().month
             default_next_month = (current_month % 12) + 1
             req_month = st.selectbox("月份", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
-            # 修正：提取 index 確保為整數，避免型別衝突
-            max_day = calendar.monthrange(req_year, req_month)
+            # 徹底解決元組型別衝突：解包獲取純整數天數
+            _, max_day = calendar.monthrange(req_year, req_month)
             req_day = st.number_input("日期", min_value=1, max_value=max_day, value=1, step=1, key="n_da")
             
         selected_shift_label = st.selectbox("偏好班別：", list(SHIFT_OPTIONS.keys()))
@@ -147,7 +147,7 @@ elif selected_user == "Admin (Ward Manager)":
         
         col1, col2 = st.columns(2)
         with col1:
-            plan_year = st.selectbox("排班年份：", [2026, 2027], index=0)
+            plan_year = st.selectbox("排班年份：", (2026, 2027), index=0)
         with col2:
             plan_month = st.selectbox("排班月份：", list(range(1, 13)), index=9) # 預設 10 月
             
@@ -158,7 +158,7 @@ elif selected_user == "Admin (Ward Manager)":
         if curr_reqs:
             st.markdown("請勾選批准或駁回申請（若同日同更人數超額，建議依申請時間優先批准）：")
             for idx, r in enumerate(curr_reqs):
-                col_a, col_b = st.columns()
+                col_a, col_b = st.columns((3, 1))
                 with col_a:
                     shift_disp = r.get("shift_label", r["shift"])
                     st.write(f"**{r['name']}** 申請 **{r['month']}/{r['day']}**：{shift_disp} (原因: {r['reason']} | 提交時間: {r['timestamp']})")
@@ -174,8 +174,8 @@ elif selected_user == "Admin (Ward Manager)":
         
         if st.button("🚀 開始自動排班運算 (Run OR-Tools Solver)"):
             with st.spinner("求解器正在運算四級資歷、連續交接與休假限制，請稍候約 15 秒..."):
-                # 修正：提取 index 確保為整數天數
-                num_days = calendar.monthrange(plan_year, plan_month)
+                # 徹底解決元組型別衝突：解包獲取純整數總天數
+                _, num_days = calendar.monthrange(plan_year, plan_month)
                 first_weekday = datetime.date(plan_year, plan_month, 1).weekday()
                 days = list(range(num_days))
                 shifts = ['O', 'A', 'P', 'N', 'Day']
@@ -301,7 +301,7 @@ elif selected_user == "Admin (Ward Manager)":
                 solver.parameters.max_time_in_seconds = 20.0
                 status = solver.Solve(model)
 
-                if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+                if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     st.success("🎉 全月排班成功！已滿足所有臨床資格與硬性約束。")
                     
                     # 建立格式化 Excel 檔案
@@ -325,8 +325,8 @@ elif selected_user == "Admin (Ward Manager)":
                     weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
                     headers = ["編號", "資歷能力", "護士姓名"] + [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days] + ["總上班日", "總放假日"]
                     
-                    # 修正：加上 列號索引
-                    ws.row_dimensions.height = 28
+                    header_row_index = 3
+                    ws.row_dimensions[header_row_index].height = 28
                     for col_idx, h in enumerate(headers, 1):
                         cell = ws.cell(row=3, column=col_idx, value=h)
                         cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
