@@ -9,7 +9,7 @@ from ortools.sat.python import cp_model
 import io
 
 # 頁面配置
-st.set_page_config(page_title="O&G 產房手術室護士排班系統 (r3)", layout="wide", page_icon="🏥")
+st.set_page_config(page_title="O&G 產房手術室護士排班系統", layout="wide", page_icon="🏥")
 
 # 常數定義 (0=Mon, ..., 6=Sun)
 MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
@@ -48,11 +48,16 @@ DEFAULT_NURSES = [
     {"id": 28, "name": "Kong Tsz Sin Sarah", "cap": "C(Runner)"}
 ]
 
+# 擴充偏好選項：支援多選 (A or P) 及排除選項 (不想返 A/P/N)
 SHIFT_OPTIONS = {
-    "想放假 Day Off (O)": "O",
-    "想返早班 AM (A)": "A",
-    "想返午班 PM (P)": "P",
-    "想返夜班 Night (N)": "N"
+    "想放假 Day Off (O)": "WANT_O",
+    "想返早班 AM (A)": "WANT_A",
+    "想返午班 PM (P)": "WANT_P",
+    "想返夜班 Night (N)": "WANT_N",
+    "想返早班或午班 (A or P)": "WANT_AP",
+    "不想返夜班 (No Night)": "AVOID_N",
+    "不想返早班 (No AM)": "AVOID_A",
+    "不想返午班 (No PM)": "AVOID_P"
 }
 
 # 初始化 Session 狀態
@@ -62,38 +67,40 @@ if "generated_schedule" not in st.session_state:
     st.session_state.generated_schedule = None
 
 # ==========================================
-# 介面 Page 1: 人員身份選擇 (下拉選單)
+# 介面頂部: 直接於主頁面選擇身份 (手機開啟一目了然，不設隱藏側邊欄)
 # ==========================================
-st.sidebar.title("🏥 O&G 排班系統 (r3)")
+st.title("🏥 O&G 產房手術室護士排班系統")
+
 nurse_names = [n["name"] for n in DEFAULT_NURSES]
-user_options = ["請選擇...", "Admin (Ward Manager)"] + nurse_names
+user_options = ["請選擇您的身份...", "Admin (Ward Manager)"] + nurse_names
 
-selected_user = st.sidebar.selectbox("請選擇使用者身份：", user_options)
+selected_user = st.selectbox("👤 請選擇使用者身份 (Select User)：", user_options, index=0)
 
 # ==========================================
-# 介面分支 A：護士專用操作頁面 (Page 2 - 4)
+# 介面分支 A：護士專用操作頁面
 # ==========================================
-if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
-    st.header(f"👋 您好，{selected_user}")
+if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
+    st.markdown(f"### 👋 您好，**{selected_user}**")
     
     tab1, tab2 = st.tabs(["📝 填寫特別申請 (Make Special Request)", "📅 查看已公佈班表 (See Duty Schedule)"])
     
     with tab1:
         st.subheader("15 號前登記下月特別更次 / 放假申請")
-        st.info("提示：若下月無特別偏好則無須填寫。系統會自動以「P-A-N-O」及「雙連休 O-O」的人性化優選模式為您排班。")
+        st.info("提示：若下月無任何特別偏好，則無須填寫。")
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            req_year = st.selectbox("年份", (2026, 2027), index=0, key="n_yr")
+            req_year = st.selectbox("年份 (Year)", (2026, 2027), index=0, key="n_yr")
         with col2:
             current_month = datetime.date.today().month
             default_next_month = (current_month % 12) + 1
-            req_month = st.selectbox("月份", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
+            req_month = st.selectbox("月份 (Month)", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
             _, max_day = calendar.monthrange(req_year, req_month)
-            req_day = st.number_input("日期", min_value=1, max_value=max_day, value=1, step=1, key="n_da")
+            # 日期採用下拉滾動選單 (Scroll down) 替代 +/- 按鈕
+            req_day = st.selectbox("日期 (Date)", list(range(1, max_day + 1)), index=0, key="n_da")
             
-        selected_shift_label = st.selectbox("偏好班別：", list(SHIFT_OPTIONS.keys()))
+        selected_shift_label = st.selectbox("偏好更次 / 休假意願 (Preferred / Avoid Shift)：", list(SHIFT_OPTIONS.keys()))
         shift_code = SHIFT_OPTIONS[selected_shift_label]
         
         req_reason = st.text_input("備註原因 (選填)：", "")
@@ -117,8 +124,10 @@ if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
         st.subheader("您已提交的申請記錄：")
         my_reqs = [r for r in st.session_state.requests_db if r["name"] == selected_user]
         if my_reqs:
+            # 日期由小至大排序
+            my_reqs.sort(key=lambda r: (r["year"], r["month"], r["day"], r["timestamp"]))
             df_my = pd.DataFrame(my_reqs)
-            st.dataframe(df_my[["year", "month", "day", "shift_label", "reason", "status"]], use_container_width=True)
+            st.dataframe(df_my[["year", "month", "day", "shift_label", "reason", "status", "timestamp"]], use_container_width=True)
             if st.button("撤回我的所有申請"):
                 st.session_state.requests_db = [r for r in st.session_state.requests_db if r["name"] != selected_user]
                 st.rerun()
@@ -133,14 +142,15 @@ if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
             st.info("管理員尚未發布最新月份的排班表。")
 
 # ==========================================
-# 介面分支 B：管理員 Admin (WM) 操作頁面 (Page 2 - 4)
+# 介面分支 B：管理員 Admin (WM) 操作頁面
 # ==========================================
 elif selected_user == "Admin (Ward Manager)":
-    st.header("⚙️ 護士長管理後台 (Ward Manager Workstation) — Revision 3")
+    st.markdown("### ⚙️ 護士長管理後台 (Ward Manager Workstation)")
     
-    admin_pin = st.sidebar.text_input("請輸入管理員密碼：", type="password")
+    # 密碼輸入同樣置於主頁面
+    admin_pin = st.text_input("請輸入管理員密碼：", type="password")
     if admin_pin != "og2026":
-        st.warning("請在左側輸入管理員密碼（預設：`og2026`）以解鎖管理權限。")
+        st.warning("請在上方輸入管理員密碼（預設：`og2026`）以解鎖管理權限。")
     else:
         st.success("✅ 管理員權限已驗證")
         
@@ -150,30 +160,34 @@ elif selected_user == "Admin (Ward Manager)":
         with col2:
             plan_month = st.selectbox("排班月份：", list(range(1, 13)), index=9)
             
-        st.subheader("📋 步驟一：20 號前審查各護士之特別申請 (Review & Settle Crashes)")
+        st.subheader("📋 步驟一：審查申請與衝突調解 (Review & Settle Crashes)")
         curr_reqs = [r for r in st.session_state.requests_db if r["year"] == plan_year and r["month"] == plan_month]
         
         approved_reqs = []
         if curr_reqs:
-            st.markdown("請勾選批准或駁回申請（若同日同更人數超額，建議依申請時間優先批准）：")
+            # 依需求 5：以「日期 (Date) 優先 ➔ 姓名 ➔ 申請班別 ➔ 原因 ➔ 提交時間」排序
+            curr_reqs.sort(key=lambda r: (int(r["day"]), r["name"], r["shift"], r["reason"], r["timestamp"]))
+            
+            st.markdown("依**日期**排列之申請清單（請勾選批准或駁回）：")
             for idx, r in enumerate(curr_reqs):
-                col_a, col_b = st.columns((3, 1))
+                col_a, col_b = st.columns((4, 1))
                 with col_a:
                     shift_disp = r.get("shift_label", r["shift"])
-                    st.write(f"**{r['name']}** 申請 **{r['month']}/{r['day']}**：{shift_disp} (原因: {r['reason']} | 提交時間: {r['timestamp']})")
+                    reason_disp = f" | 原因: {r['reason']}" if r['reason'] else ""
+                    st.write(f"📅 **{r['month']}/{r['day']}日** — **{r['name']}** ：`{shift_disp}`{reason_disp} (提交時間: {r['timestamp']})")
                 with col_b:
                     is_app = st.checkbox("批准", value=True, key=f"app_{idx}")
                     if is_app:
                         approved_reqs.append(r)
         else:
-            st.info("該月份目前暫無護士登記特別申請（全員按 Revision 3 人性化標準規則自動排班）。")
+            st.info("該月份目前暫無護士登記特別申請。")
             
         st.markdown("---")
-        st.subheader("⚡ 步驟二：自動生成全月排班表 (Generate Duty Schedule)")
-        st.caption("✨ Revision 3 人性化引擎：自動最大化連休時數、聚攏雙連休 O-O、極力消除 O-P-O-P 碎假、成對落實 A-N-O 閉環、優先引導 P-A-N-O 黃金班型，並均攤全體夜班負擔。")
+        st.subheader("⚡ 步驟二：生成全月排班表 (Generate Duty Schedule)")
         
-        if st.button("🚀 開始自動排班運算 (Run OR-Tools Solver)"):
-            with st.spinner("求解器正在運算四級資歷、P-A-N-O黃金更次、O-O連休聚攏與夜更公平輪替，請稍候約 20 秒..."):
+        # 依需求 2：精簡文案
+        if st.button("🚀 生成排班表 (Generate Schedule)"):
+            with st.spinner("正在生成排班表，請稍候... (Generating duty schedule...)"):
                 _, num_days = calendar.monthrange(plan_year, plan_month)
                 first_weekday = datetime.date(plan_year, plan_month, 1).weekday()
                 days = list(range(num_days))
@@ -276,11 +290,8 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) >= 4)
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) <= 5)
 
-                # ==========================================
-                # 7. Revision 3 人性化排班模型增強
-                # ==========================================
-
-                # (A) 夜班均攤公平性 (每位護士月夜班次數在 3 至 6 班之間)
+                # 7. 人性化目標與偏好模型
+                # (A) 夜班均攤公平性
                 night_fairness_penalties = []
                 for n in DEFAULT_NURSES:
                     total_nights = sum(shift_assigned(n['id'], d, 'N') for d in days)
@@ -292,7 +303,7 @@ elif selected_user == "Admin (Ward Manager)":
                     model.AddAbsEquality(abs_ndiff, ndiff)
                     night_fairness_penalties.append(abs_ndiff)
 
-                # (B) 聚攏雙連休 (O - O) 獎勵
+                # (B) 聚攏雙連休 (O - O)
                 oo_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -301,7 +312,7 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_oo <= x[n['id'], d + 1, 'O', 'None'])
                         oo_rewards.append(is_oo)
 
-                # (C) 嚴懲碎片化單日交替休假 (防止 O-P-O-P / O-A-O-A 等碎假)
+                # (C) 嚴懲單日碎片碎假 (防止 O-P-O-P / O-A-O-A)
                 isolated_off_penalties = []
                 for n in DEFAULT_NURSES:
                     for d in range(1, num_days - 1):
@@ -311,7 +322,7 @@ elif selected_user == "Admin (Ward Manager)":
                                             (1 - x[n['id'], d + 1, 'O', 'None']) - 2)
                         isolated_off_penalties.append(is_iso)
 
-                # (D) 成對落實 A - N - O 閉環獎勵
+                # (D) A - N - O 閉環成對
                 ano_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -320,7 +331,7 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_ano <= x[n['id'], d + 1, 'O', 'None'])
                         ano_rewards.append(is_ano)
 
-                # (E) P - A - N - O 極佳黃金組合加分
+                # (E) P - A - N - O 黃金組合
                 pano_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in range(2, num_days - 1):
@@ -330,18 +341,30 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_pano <= x[n['id'], d + 1, 'O', 'None'])
                         pano_rewards.append(is_pano)
 
-                # 8. 套用 WM 批准之申請
+                # 8. 套用已批准之申請 (支援多選 A or P 及排除不想返之班別)
                 for r in approved_reqs:
                     n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
                     if n_match:
                         d_idx = int(r["day"]) - 1
-                        s_target = r["shift"]
-                        if s_target == "O":
+                        s_code = r["shift"]
+                        if s_code == "WANT_O":
                             model.Add(x[n_match['id'], d_idx, 'O', 'None'] == 1)
-                        else:
-                            model.Add(shift_assigned(n_match['id'], d_idx, s_target) == 1)
+                        elif s_code == "WANT_A":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 1)
+                        elif s_code == "WANT_P":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 1)
+                        elif s_code == "WANT_N":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 1)
+                        elif s_code == "WANT_AP":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') + shift_assigned(n_match['id'], d_idx, 'P') == 1)
+                        elif s_code == "AVOID_N":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 0)
+                        elif s_code == "AVOID_A":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 0)
+                        elif s_code == "AVOID_P":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 0)
 
-                # 目標函數綜合評分
+                # 目標評分
                 scores = [
                     -50 * sum(off_penalties),
                     -25 * sum(night_fairness_penalties),
@@ -362,7 +385,7 @@ elif selected_user == "Admin (Ward Manager)":
                 status = solver.Solve(model)
 
                 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    st.success("🎉 全月排班成功！已成功套用 Revision 3 人性化連休與 P-A-N-O 黃金模式。")
+                    st.success("✅ 班表已成功生成！ (Duty schedule successfully generated!)")
                     
                     # 建立格式化 Excel 檔案
                     wb = openpyxl.Workbook()
@@ -370,20 +393,21 @@ elif selected_user == "Admin (Ward Manager)":
                     ws.title = f"{plan_year}-{plan_month:02d} 班表"
                     
                     shift_fills = {
-                        'A': PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),   # 淺綠
-                        'P': PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),   # 暖橙
-                        'N': PatternFill(start_color="E1D5E7", end_color="E1D5E7", fill_type="solid"),   # 粉紫
-                        'Day': PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"), # 柔藍
-                        'O': PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"),   # 淺灰
+                        'A': PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+                        'P': PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid"),
+                        'N': PatternFill(start_color="E1D5E7", end_color="E1D5E7", fill_type="solid"),
+                        'Day': PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"),
+                        'O': PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"),
                     }
                     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
                     weekend_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
                     border = Border(left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
                                     top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9'))
                     
-                    ws.cell(row=1, column=1, value=f"O&G 手術室及病房護士排班表 ({plan_year}年{plan_month}月 - Revision 3)").font = Font(name="Arial", size=14, bold=True, color="1F497D")
+                    ws.cell(row=1, column=1, value=f"O&G 手術室及病房護士排班表 ({plan_year}年{plan_month}月)").font = Font(name="Arial", size=14, bold=True, color="1F497D")
                     weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
-                    headers = ["編號", "資歷能力", "護士姓名"] + [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days] + ["總上班日", "總放假日"]
+                    day_headers = [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days]
+                    headers = ["編號", "資歷能力", "護士姓名"] + day_headers + ["總上班日", "總放假日"]
                     
                     header_row_index = 3
                     ws.row_dimensions[header_row_index].height = 28
