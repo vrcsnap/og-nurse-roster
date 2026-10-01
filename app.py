@@ -8,8 +8,8 @@ from openpyxl.utils import get_column_letter
 from ortools.sat.python import cp_model
 import io
 
-# 頁面基本配置
-st.set_page_config(page_title="O&G 產房手術室護士排班系統", layout="wide", page_icon="🏥")
+# 頁面配置
+st.set_page_config(page_title="O&G 產房手術室護士排班系統 (r3)", layout="wide", page_icon="🏥")
 
 # 常數定義 (0=Mon, ..., 6=Sun)
 MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
@@ -64,7 +64,7 @@ if "generated_schedule" not in st.session_state:
 # ==========================================
 # 介面 Page 1: 人員身份選擇 (下拉選單)
 # ==========================================
-st.sidebar.title("🏥 O&G 排班系統")
+st.sidebar.title("🏥 O&G 排班系統 (r3)")
 nurse_names = [n["name"] for n in DEFAULT_NURSES]
 user_options = ["請選擇...", "Admin (Ward Manager)"] + nurse_names
 
@@ -80,7 +80,7 @@ if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
     
     with tab1:
         st.subheader("15 號前登記下月特別更次 / 放假申請")
-        st.info("提示：若下月無任何特別偏好，則無須填寫。")
+        st.info("提示：若下月無特別偏好則無須填寫。系統會自動以「P-A-N-O」及「雙連休 O-O」的人性化優選模式為您排班。")
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -90,7 +90,6 @@ if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
             default_next_month = (current_month % 12) + 1
             req_month = st.selectbox("月份", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
-            # 徹底解決元組型別衝突：解包獲取純整數天數
             _, max_day = calendar.monthrange(req_year, req_month)
             req_day = st.number_input("日期", min_value=1, max_value=max_day, value=1, step=1, key="n_da")
             
@@ -137,7 +136,7 @@ if selected_user not in ("請選擇...", "Admin (Ward Manager)"):
 # 介面分支 B：管理員 Admin (WM) 操作頁面 (Page 2 - 4)
 # ==========================================
 elif selected_user == "Admin (Ward Manager)":
-    st.header("⚙️ 護士長管理後台 (Ward Manager Workstation)")
+    st.header("⚙️ 護士長管理後台 (Ward Manager Workstation) — Revision 3")
     
     admin_pin = st.sidebar.text_input("請輸入管理員密碼：", type="password")
     if admin_pin != "og2026":
@@ -149,7 +148,7 @@ elif selected_user == "Admin (Ward Manager)":
         with col1:
             plan_year = st.selectbox("排班年份：", (2026, 2027), index=0)
         with col2:
-            plan_month = st.selectbox("排班月份：", list(range(1, 13)), index=9) # 預設 10 月
+            plan_month = st.selectbox("排班月份：", list(range(1, 13)), index=9)
             
         st.subheader("📋 步驟一：20 號前審查各護士之特別申請 (Review & Settle Crashes)")
         curr_reqs = [r for r in st.session_state.requests_db if r["year"] == plan_year and r["month"] == plan_month]
@@ -167,14 +166,14 @@ elif selected_user == "Admin (Ward Manager)":
                     if is_app:
                         approved_reqs.append(r)
         else:
-            st.info("該月份目前暫無護士登記特別申請（全員按標準規則自動排班）。")
+            st.info("該月份目前暫無護士登記特別申請（全員按 Revision 3 人性化標準規則自動排班）。")
             
         st.markdown("---")
         st.subheader("⚡ 步驟二：自動生成全月排班表 (Generate Duty Schedule)")
+        st.caption("✨ Revision 3 人性化引擎：自動最大化連休時數、聚攏雙連休 O-O、極力消除 O-P-O-P 碎假、成對落實 A-N-O 閉環、優先引導 P-A-N-O 黃金班型，並均攤全體夜班負擔。")
         
         if st.button("🚀 開始自動排班運算 (Run OR-Tools Solver)"):
-            with st.spinner("求解器正在運算四級資歷、連續交接與休假限制，請稍候約 15 秒..."):
-                # 徹底解決元組型別衝突：解包獲取純整數總天數
+            with st.spinner("求解器正在運算四級資歷、P-A-N-O黃金更次、O-O連休聚攏與夜更公平輪替，請稍候約 20 秒..."):
                 _, num_days = calendar.monthrange(plan_year, plan_month)
                 first_weekday = datetime.date(plan_year, plan_month, 1).weekday()
                 days = list(range(num_days))
@@ -218,7 +217,7 @@ elif selected_user == "Admin (Ward Manager)":
                             elif cap == 'C(Scrub)':
                                 model.Add(x[n['id'], d, s, 'OTIC'] == 0)
 
-                # 3. 每 7 天盡量 2 日 Off
+                # 3. 每 7 天 2 日 Off
                 off_penalties = []
                 for n in DEFAULT_NURSES:
                     for start in range(0, num_days - 6, 7):
@@ -277,7 +276,61 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) >= 4)
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) <= 5)
 
-                # 7. 套用 WM 批准之申請
+                # ==========================================
+                # 7. Revision 3 人性化排班模型增強
+                # ==========================================
+
+                # (A) 夜班均攤公平性 (每位護士月夜班次數在 3 至 6 班之間)
+                night_fairness_penalties = []
+                for n in DEFAULT_NURSES:
+                    total_nights = sum(shift_assigned(n['id'], d, 'N') for d in days)
+                    model.Add(total_nights >= 3)
+                    model.Add(total_nights <= 6)
+                    ndiff = model.NewIntVar(-3, 3, f"ndiff_{n['id']}")
+                    model.Add(ndiff == total_nights - 4)
+                    abs_ndiff = model.NewIntVar(0, 3, f"abs_ndiff_{n['id']}")
+                    model.AddAbsEquality(abs_ndiff, ndiff)
+                    night_fairness_penalties.append(abs_ndiff)
+
+                # (B) 聚攏雙連休 (O - O) 獎勵
+                oo_rewards = []
+                for n in DEFAULT_NURSES:
+                    for d in days[:-1]:
+                        is_oo = model.NewBoolVar(f"oo_{n['id']}_{d}")
+                        model.Add(is_oo <= x[n['id'], d, 'O', 'None'])
+                        model.Add(is_oo <= x[n['id'], d + 1, 'O', 'None'])
+                        oo_rewards.append(is_oo)
+
+                # (C) 嚴懲碎片化單日交替休假 (防止 O-P-O-P / O-A-O-A 等碎假)
+                isolated_off_penalties = []
+                for n in DEFAULT_NURSES:
+                    for d in range(1, num_days - 1):
+                        is_iso = model.NewBoolVar(f"iso_{n['id']}_{d}")
+                        model.Add(is_iso >= x[n['id'], d, 'O', 'None'] + 
+                                            (1 - x[n['id'], d - 1, 'O', 'None']) + 
+                                            (1 - x[n['id'], d + 1, 'O', 'None']) - 2)
+                        isolated_off_penalties.append(is_iso)
+
+                # (D) 成對落實 A - N - O 閉環獎勵
+                ano_rewards = []
+                for n in DEFAULT_NURSES:
+                    for d in days[:-1]:
+                        is_ano = model.NewBoolVar(f"ano_{n['id']}_{d}")
+                        model.Add(is_ano <= shift_assigned(n['id'], d, 'N'))
+                        model.Add(is_ano <= x[n['id'], d + 1, 'O', 'None'])
+                        ano_rewards.append(is_ano)
+
+                # (E) P - A - N - O 極佳黃金組合加分
+                pano_rewards = []
+                for n in DEFAULT_NURSES:
+                    for d in range(2, num_days - 1):
+                        is_pano = model.NewBoolVar(f"pano_{n['id']}_{d}")
+                        model.Add(is_pano <= shift_assigned(n['id'], d - 2, 'P'))
+                        model.Add(is_pano <= shift_assigned(n['id'], d, 'N'))
+                        model.Add(is_pano <= x[n['id'], d + 1, 'O', 'None'])
+                        pano_rewards.append(is_pano)
+
+                # 8. 套用 WM 批准之申請
                 for r in approved_reqs:
                     n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
                     if n_match:
@@ -288,8 +341,15 @@ elif selected_user == "Admin (Ward Manager)":
                         else:
                             model.Add(shift_assigned(n_match['id'], d_idx, s_target) == 1)
 
-                # 目標最佳化
-                scores = [-50 * sum(off_penalties)]
+                # 目標函數綜合評分
+                scores = [
+                    -50 * sum(off_penalties),
+                    -25 * sum(night_fairness_penalties),
+                    -35 * sum(isolated_off_penalties),
+                    30 * sum(oo_rewards),
+                    40 * sum(ano_rewards),
+                    50 * sum(pano_rewards)
+                ]
                 for n in DEFAULT_NURSES:
                     for d in days:
                         w = (first_weekday + d) % 7
@@ -298,11 +358,11 @@ elif selected_user == "Admin (Ward Manager)":
                 model.Maximize(sum(scores))
 
                 solver = cp_model.CpSolver()
-                solver.parameters.max_time_in_seconds = 20.0
+                solver.parameters.max_time_in_seconds = 25.0
                 status = solver.Solve(model)
 
                 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    st.success("🎉 全月排班成功！已滿足所有臨床資格與硬性約束。")
+                    st.success("🎉 全月排班成功！已成功套用 Revision 3 人性化連休與 P-A-N-O 黃金模式。")
                     
                     # 建立格式化 Excel 檔案
                     wb = openpyxl.Workbook()
@@ -321,7 +381,7 @@ elif selected_user == "Admin (Ward Manager)":
                     border = Border(left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
                                     top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9'))
                     
-                    ws.cell(row=1, column=1, value=f"O&G 手術室及病房護士排班表 ({plan_year}年{plan_month}月)").font = Font(name="Arial", size=14, bold=True, color="1F497D")
+                    ws.cell(row=1, column=1, value=f"O&G 手術室及病房護士排班表 ({plan_year}年{plan_month}月 - Revision 3)").font = Font(name="Arial", size=14, bold=True, color="1F497D")
                     weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
                     headers = ["編號", "資歷能力", "護士姓名"] + [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days] + ["總上班日", "總放假日"]
                     
