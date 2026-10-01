@@ -48,16 +48,18 @@ DEFAULT_NURSES = [
     {"id": 28, "name": "Kong Tsz Sin Sarah", "cap": "C(Runner)"}
 ]
 
-# 擴充偏好選項：支援多選 (A or P) 及排除選項 (不想返 A/P/N)
+# 擴充偏好選項：新增 想返 Day 及 不想返 Day
 SHIFT_OPTIONS = {
     "想放假 Day Off (O)": "WANT_O",
     "想返早班 AM (A)": "WANT_A",
     "想返午班 PM (P)": "WANT_P",
     "想返夜班 Night (N)": "WANT_N",
+    "想返日間常規班 (Day)": "WANT_DAY",
     "想返早班或午班 (A or P)": "WANT_AP",
     "不想返夜班 (No Night)": "AVOID_N",
     "不想返早班 (No AM)": "AVOID_A",
-    "不想返午班 (No PM)": "AVOID_P"
+    "不想返午班 (No PM)": "AVOID_P",
+    "不想返日間常規班 (No Day)": "AVOID_DAY"
 }
 
 # 初始化 Session 狀態
@@ -67,7 +69,7 @@ if "generated_schedule" not in st.session_state:
     st.session_state.generated_schedule = None
 
 # ==========================================
-# 介面頂部: 直接於主頁面選擇身份 (手機開啟一目了然，不設隱藏側邊欄)
+# 介面頂部: 直接於主頁面選擇身份 (手機開啟一目了然)
 # ==========================================
 st.title("🏥 O&G 產房手術室護士排班系統")
 
@@ -97,7 +99,7 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
             req_month = st.selectbox("月份 (Month)", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
             _, max_day = calendar.monthrange(req_year, req_month)
-            # 日期採用下拉滾動選單 (Scroll down) 替代 +/- 按鈕
+            # 日期採用下拉滾動選單 (Scroll down)
             req_day = st.selectbox("日期 (Date)", list(range(1, max_day + 1)), index=0, key="n_da")
             
         selected_shift_label = st.selectbox("偏好更次 / 休假意願 (Preferred / Avoid Shift)：", list(SHIFT_OPTIONS.keys()))
@@ -124,7 +126,7 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
         st.subheader("您已提交的申請記錄：")
         my_reqs = [r for r in st.session_state.requests_db if r["name"] == selected_user]
         if my_reqs:
-            # 日期由小至大排序
+            # 排序：日期由小至大
             my_reqs.sort(key=lambda r: (r["year"], r["month"], r["day"], r["timestamp"]))
             df_my = pd.DataFrame(my_reqs)
             st.dataframe(df_my[["year", "month", "day", "shift_label", "reason", "status", "timestamp"]], use_container_width=True)
@@ -147,7 +149,6 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
 elif selected_user == "Admin (Ward Manager)":
     st.markdown("### ⚙️ 護士長管理後台 (Ward Manager Workstation)")
     
-    # 密碼輸入同樣置於主頁面
     admin_pin = st.text_input("請輸入管理員密碼：", type="password")
     if admin_pin != "og2026":
         st.warning("請在上方輸入管理員密碼（預設：`og2026`）以解鎖管理權限。")
@@ -165,7 +166,7 @@ elif selected_user == "Admin (Ward Manager)":
         
         approved_reqs = []
         if curr_reqs:
-            # 依需求 5：以「日期 (Date) 優先 ➔ 姓名 ➔ 申請班別 ➔ 原因 ➔ 提交時間」排序
+            # 依日期優先排序：日期 ➔ 姓名 ➔ 申請班別 ➔ 原因 ➔ 提交時間
             curr_reqs.sort(key=lambda r: (int(r["day"]), r["name"], r["shift"], r["reason"], r["timestamp"]))
             
             st.markdown("依**日期**排列之申請清單（請勾選批准或駁回）：")
@@ -185,7 +186,6 @@ elif selected_user == "Admin (Ward Manager)":
         st.markdown("---")
         st.subheader("⚡ 步驟二：生成全月排班表 (Generate Duty Schedule)")
         
-        # 依需求 2：精簡文案
         if st.button("🚀 生成排班表 (Generate Schedule)"):
             with st.spinner("正在生成排班表，請稍候... (Generating duty schedule...)"):
                 _, num_days = calendar.monthrange(plan_year, plan_month)
@@ -231,17 +231,41 @@ elif selected_user == "Admin (Ward Manager)":
                             elif cap == 'C(Scrub)':
                                 model.Add(x[n['id'], d, s, 'OTIC'] == 0)
 
-                # 3. 每 7 天 2 日 Off
+                # 3. 每週工時約 44 小時與每週 2 日 Off，每週盡量最多 1 次 Night
                 off_penalties = []
+                weekly_hour_penalties = []
+                night_per_week_penalties = []
+
                 for n in DEFAULT_NURSES:
                     for start in range(0, num_days - 6, 7):
                         window = range(start, start + 7)
+                        
+                        # (a) 每 7 天 2 日 Off
                         w_offs = sum(x[n['id'], d, 'O', 'None'] for d in window)
-                        diff = model.NewIntVar(-7, 7, f"d_{n['id']}_{start}")
-                        model.Add(diff == w_offs - 2)
-                        ad = model.NewIntVar(0, 7, f"ad_{n['id']}_{start}")
-                        model.AddAbsEquality(ad, diff)
-                        off_penalties.append(ad)
+                        diff_o = model.NewIntVar(-7, 7, f"d_o_{n['id']}_{start}")
+                        model.Add(diff_o == w_offs - 2)
+                        ad_o = model.NewIntVar(0, 7, f"ad_o_{n['id']}_{start}")
+                        model.AddAbsEquality(ad_o, diff_o)
+                        off_penalties.append(ad_o)
+                        
+                        # (b) 需求 1：每週工時控制在約 44 小時 (A=8, P=8, Day=8, N=10)
+                        w_hours = model.NewIntVar(0, 70, f"wh_{n['id']}_{start}")
+                        model.Add(w_hours == sum(
+                            8 * (shift_assigned(n['id'], d, 'A') + shift_assigned(n['id'], d, 'P') + shift_assigned(n['id'], d, 'Day')) +
+                            10 * shift_assigned(n['id'], d, 'N')
+                            for d in window
+                        ))
+                        h_diff = model.NewIntVar(-44, 44, f"hdiff_{n['id']}_{start}")
+                        model.Add(h_diff == w_hours - 44)
+                        abs_hdiff = model.NewIntVar(0, 44, f"abs_hdiff_{n['id']}_{start}")
+                        model.AddAbsEquality(abs_hdiff, h_diff)
+                        weekly_hour_penalties.append(abs_hdiff)
+                        
+                        # (c) 需求 2：每週盡量只有 1 次 Night 更
+                        w_nights = sum(shift_assigned(n['id'], d, 'N') for d in window)
+                        extra_nights = model.NewIntVar(0, 7, f"extra_n_{n['id']}_{start}")
+                        model.Add(extra_nights >= w_nights - 1)
+                        night_per_week_penalties.append(extra_nights)
 
                 # 4. 交接連續性 (一P接二A, 二P接三A, 四P接五A)
                 for d in days[:-1]:
@@ -250,7 +274,7 @@ elif selected_user == "Admin (Ward Manager)":
                         for n in DEFAULT_NURSES:
                             model.Add(x[n['id'], d, 'P', 'OTIC'] == x[n['id'], d + 1, 'A', 'OTIC'])
 
-                # 5. 夜班過渡管制
+                # 5. 夜班過渡管制 (A -> N -> O)
                 for n in DEFAULT_NURSES:
                     for d in days:
                         if d > 0:
@@ -291,19 +315,19 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) <= 5)
 
                 # 7. 人性化目標與偏好模型
-                # (A) 夜班均攤公平性
+                # 需求 3：各護士夜班次數嚴格均衡分攤 (每人全月 4 至 5 班)
                 night_fairness_penalties = []
                 for n in DEFAULT_NURSES:
                     total_nights = sum(shift_assigned(n['id'], d, 'N') for d in days)
-                    model.Add(total_nights >= 3)
-                    model.Add(total_nights <= 6)
-                    ndiff = model.NewIntVar(-3, 3, f"ndiff_{n['id']}")
+                    model.Add(total_nights >= 4)
+                    model.Add(total_nights <= 5)
+                    ndiff = model.NewIntVar(-1, 1, f"ndiff_{n['id']}")
                     model.Add(ndiff == total_nights - 4)
-                    abs_ndiff = model.NewIntVar(0, 3, f"abs_ndiff_{n['id']}")
+                    abs_ndiff = model.NewIntVar(0, 1, f"abs_ndiff_{n['id']}")
                     model.AddAbsEquality(abs_ndiff, ndiff)
                     night_fairness_penalties.append(abs_ndiff)
 
-                # (B) 聚攏雙連休 (O - O)
+                # 聚攏雙連休 (O - O)
                 oo_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -312,7 +336,7 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_oo <= x[n['id'], d + 1, 'O', 'None'])
                         oo_rewards.append(is_oo)
 
-                # (C) 嚴懲單日碎片碎假 (防止 O-P-O-P / O-A-O-A)
+                # 嚴懲單日碎片碎假 (防止 O-P-O-P / O-A-O-A)
                 isolated_off_penalties = []
                 for n in DEFAULT_NURSES:
                     for d in range(1, num_days - 1):
@@ -322,7 +346,7 @@ elif selected_user == "Admin (Ward Manager)":
                                             (1 - x[n['id'], d + 1, 'O', 'None']) - 2)
                         isolated_off_penalties.append(is_iso)
 
-                # (D) A - N - O 閉環成對
+                # A - N - O 閉環成對
                 ano_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -331,7 +355,7 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_ano <= x[n['id'], d + 1, 'O', 'None'])
                         ano_rewards.append(is_ano)
 
-                # (E) P - A - N - O 黃金組合
+                # P - A - N - O 黃金組合
                 pano_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in range(2, num_days - 1):
@@ -341,7 +365,7 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_pano <= x[n['id'], d + 1, 'O', 'None'])
                         pano_rewards.append(is_pano)
 
-                # 8. 套用已批准之申請 (支援多選 A or P 及排除不想返之班別)
+                # 8. 套用已批准之申請 (支援多選 A or P、Day 及排除不想返之班別)
                 for r in approved_reqs:
                     n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
                     if n_match:
@@ -355,6 +379,8 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 1)
                         elif s_code == "WANT_N":
                             model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 1)
+                        elif s_code == "WANT_DAY":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 1)
                         elif s_code == "WANT_AP":
                             model.Add(shift_assigned(n_match['id'], d_idx, 'A') + shift_assigned(n_match['id'], d_idx, 'P') == 1)
                         elif s_code == "AVOID_N":
@@ -363,11 +389,15 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 0)
                         elif s_code == "AVOID_P":
                             model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 0)
+                        elif s_code == "AVOID_DAY":
+                            model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 0)
 
                 # 目標評分
                 scores = [
                     -50 * sum(off_penalties),
-                    -25 * sum(night_fairness_penalties),
+                    -10 * sum(weekly_hour_penalties),
+                    -60 * sum(night_per_week_penalties),
+                    -30 * sum(night_fairness_penalties),
                     -35 * sum(isolated_off_penalties),
                     30 * sum(oo_rewards),
                     40 * sum(ano_rewards),
