@@ -48,8 +48,23 @@ DEFAULT_NURSES = [
     {"id": 28, "name": "Kong Tsz Sin Sarah", "cap": "C(Runner)"}
 ]
 
-# 擴充偏好選項：新增 想返 Day 及 不想返 Day
-SHIFT_OPTIONS = {
+# 護士偏好選項
+NURSE_SHIFT_OPTIONS = {
+    "想放假 Day Off (O)": "WANT_O",
+    "想返早班 AM (A)": "WANT_A",
+    "想返午班 PM (P)": "WANT_P",
+    "想返夜班 Night (N)": "WANT_N",
+    "想返日間常規班 (Day)": "WANT_DAY",
+    "想返早班或午班 (A or P)": "WANT_AP",
+    "不想返夜班 (No Night)": "AVOID_N",
+    "不想返早班 (No AM)": "AVOID_A",
+    "不想返午班 (No PM)": "AVOID_P",
+    "不想返日間常規班 (No Day)": "AVOID_DAY"
+}
+
+# 管理員偏好選項 (包含連續長夜班 Long Night)
+ADMIN_SHIFT_OPTIONS = {
+    "指定連續長夜班 (Long Night)": "LONG_NIGHT",
     "想放假 Day Off (O)": "WANT_O",
     "想返早班 AM (A)": "WANT_A",
     "想返午班 PM (P)": "WANT_P",
@@ -67,9 +82,13 @@ if "requests_db" not in st.session_state:
     st.session_state.requests_db = []
 if "generated_schedule" not in st.session_state:
     st.session_state.generated_schedule = None
+if "daily_details" not in st.session_state:
+    st.session_state.daily_details = None
+if "plan_meta" not in st.session_state:
+    st.session_state.plan_meta = None
 
 # ==========================================
-# 介面頂部: 直接於主頁面選擇身份 (手機開啟一目了然)
+# 介面頂部: 直接於主頁面選擇身份
 # ==========================================
 st.title("🏥 O&G 產房手術室護士排班系統")
 
@@ -77,6 +96,31 @@ nurse_names = [n["name"] for n in DEFAULT_NURSES]
 user_options = ["請選擇您的身份...", "Admin (Ward Manager)"] + nurse_names
 
 selected_user = st.selectbox("👤 請選擇使用者身份 (Select User)：", user_options, index=0)
+
+# ==========================================
+# 輔助函式：護士申請限制驗證 (每週最多2項、週末最多1個O)
+# ==========================================
+def validate_nurse_request(existing_reqs, nurse_name, year, month, day, shift_code):
+    dt = datetime.date(year, month, day)
+    w_key = dt.isocalendar()[:2]  # (year, week_num)
+    iso_weekday = dt.isoweekday()  # 1=Mon, ..., 6=Sat, 7=Sun
+    
+    nurse_reqs = [r for r in existing_reqs if r["name"] == nurse_name and r["year"] == year and r["month"] == month]
+    
+    # 計算該週 (週一至週日) 已有的申請數量 (扣除同日更替)
+    same_week_reqs = [r for r in nurse_reqs if datetime.date(r["year"], r["month"], r["day"]).isocalendar()[:2] == w_key and r["day"] != day]
+    
+    if len(same_week_reqs) >= 2:
+        return False, f"每位護士每週（星期一至星期日）最多只可提交 2 項特別申請！該週您已有 {len(same_week_reqs)} 項登記。"
+        
+    # 週末只可申請 1 個 O (星期六及日不能同時為 O)
+    if shift_code == "WANT_O" and iso_weekday in (6, 7):
+        for r in same_week_reqs:
+            r_dt = datetime.date(r["year"], r["month"], r["day"])
+            if r_dt.isoweekday() in (6, 7) and r["shift"] == "WANT_O":
+                return False, "每週週末（星期六及日）最多只可申請 1 天例假 (Day Off)，不可同時申請星期六與星期日放假！"
+                
+    return True, ""
 
 # ==========================================
 # 介面分支 A：護士專用操作頁面
@@ -88,7 +132,7 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
     
     with tab1:
         st.subheader("15 號前登記下月特別更次 / 放假申請")
-        st.info("提示：若下月無任何特別偏好，則無須填寫。")
+        st.info("📌 規則提示：每週（星期一至日）最多申請 2 項；週末（星期六及日）最多只可申請 1 天例假 (Day Off)。若無特別偏好無須填寫。")
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -99,37 +143,54 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
             req_month = st.selectbox("月份 (Month)", list(range(1, 13)), index=default_next_month - 1, key="n_mo")
         with col3:
             _, max_day = calendar.monthrange(req_year, req_month)
-            # 日期採用下拉滾動選單 (Scroll down)
             req_day = st.selectbox("日期 (Date)", list(range(1, max_day + 1)), index=0, key="n_da")
             
-        selected_shift_label = st.selectbox("偏好更次 / 休假意願 (Preferred / Avoid Shift)：", list(SHIFT_OPTIONS.keys()))
-        shift_code = SHIFT_OPTIONS[selected_shift_label]
+        selected_shift_label = st.selectbox("偏好更次 / 休假意願 (Preferred / Avoid Shift)：", list(NURSE_SHIFT_OPTIONS.keys()))
+        shift_code = NURSE_SHIFT_OPTIONS[selected_shift_label]
         
         req_reason = st.text_input("備註原因 (選填)：", "")
         
         if st.button("提交申請 (Submit Request)"):
-            new_entry = {
-                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "name": selected_user,
-                "year": req_year,
-                "month": req_month,
-                "day": int(req_day),
-                "shift": shift_code,
-                "shift_label": selected_shift_label,
-                "reason": req_reason,
-                "status": "待審核"
-            }
-            st.session_state.requests_db.append(new_entry)
-            st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
+            is_valid, err_msg = validate_nurse_request(st.session_state.requests_db, selected_user, req_year, req_month, int(req_day), shift_code)
+            if not is_valid:
+                st.error(f"❌ 登記失敗：{err_msg}")
+            else:
+                # 移除同一天的舊申請 (如果存在)
+                st.session_state.requests_db = [
+                    r for r in st.session_state.requests_db
+                    if not (r["name"] == selected_user and r["year"] == req_year and r["month"] == req_month and r["day"] == int(req_day))
+                ]
+                new_entry = {
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "name": selected_user,
+                    "year": req_year,
+                    "month": req_month,
+                    "day": int(req_day),
+                    "shift": shift_code,
+                    "shift_label": selected_shift_label,
+                    "reason": req_reason,
+                    "status": "待審核"
+                }
+                st.session_state.requests_db.append(new_entry)
+                st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
+                st.rerun()
             
         st.markdown("---")
         st.subheader("您已提交的申請記錄：")
         my_reqs = [r for r in st.session_state.requests_db if r["name"] == selected_user]
         if my_reqs:
-            # 排序：日期由小至大
             my_reqs.sort(key=lambda r: (r["year"], r["month"], r["day"], r["timestamp"]))
-            df_my = pd.DataFrame(my_reqs)
-            st.dataframe(df_my[["year", "month", "day", "shift_label", "reason", "status", "timestamp"]], use_container_width=True)
+            
+            for idx, r in enumerate(my_reqs):
+                col_r1, col_r2 = st.columns((5, 1))
+                with col_r1:
+                    reason_str = f" | 原因: {r['reason']}" if r.get('reason') else ""
+                    st.write(f"• **{r['year']}年{r['month']}月{r['day']}日** — `{r['shift_label']}`{reason_str} （狀態: {r['status']}）")
+                with col_r2:
+                    if st.button("🗑️ 刪除", key=f"del_my_{idx}"):
+                        st.session_state.requests_db.remove(r)
+                        st.rerun()
+                        
             if st.button("撤回我的所有申請"):
                 st.session_state.requests_db = [r for r in st.session_state.requests_db if r["name"] != selected_user]
                 st.rerun()
@@ -139,7 +200,75 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
     with tab2:
         st.subheader("最新排班表預覽")
         if st.session_state.generated_schedule is not None:
-            st.dataframe(st.session_state.generated_schedule, use_container_width=True)
+            # 支援篩選特定班別
+            col_v1, col_v2 = st.columns((1, 2))
+            with col_v1:
+                nurse_view_mode = st.radio("班表顯示模式：", ["全部班別 (All Shifts)", "只顯示特定班別 (Filter by Shift)"], index=0, horizontal=True, key="n_vm")
+            
+            df_curr = st.session_state.generated_schedule.copy()
+            if nurse_view_mode == "只顯示特定班別 (Filter by Shift)":
+                with col_v2:
+                    n_filt = st.selectbox("選擇要單獨檢視的班別：", ["A 更 (早班)", "P 更 (午班)", "N 更 (夜班)", "Day 更 (日間常規班)", "O 更 (例假/休假)"], key="n_flt_s")
+                prefix_map = {"A 更 (早班)": "A", "P 更 (午班)": "P", "N 更 (夜班)": "N", "Day 更 (日間常規班)": "Day", "O 更 (例假/休假)": "O"}
+                target_code = prefix_map[n_filt]
+                day_cols = [c for c in df_curr.columns if "/" in c]
+                for c in day_cols:
+                    df_curr[c] = df_curr[c].apply(lambda v: v if (str(v).startswith(target_code) and (target_code != "A" or not str(v).startswith("AVOID"))) else "-")
+            
+            st.dataframe(df_curr, use_container_width=True)
+            
+            # 當日執勤人員詳細職責表
+            if st.session_state.daily_details is not None and st.session_state.plan_meta is not None:
+                st.markdown("---")
+                st.subheader("📅 當日執勤人員與各崗位職責詳情 (Daily Role Breakdown)")
+                p_yr = st.session_state.plan_meta["year"]
+                p_mo = st.session_state.plan_meta["month"]
+                _, p_days = calendar.monthrange(p_yr, p_mo)
+                p_fwd = datetime.date(p_yr, p_mo, 1).weekday()
+                weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
+                
+                sel_day = st.selectbox("選擇查看日期：", list(range(1, p_days + 1)), index=0, 
+                                       format_func=lambda d: f"{p_mo}月{d}日 (星期{weekday_cn[(p_fwd + d - 1) % 7]})", key="n_sel_day")
+                
+                day_list = st.session_state.daily_details.get(sel_day, [])
+                if day_list:
+                    shift_order_map = {'A': 1, 'Day': 2, 'P': 3, 'N': 4, 'O': 5}
+                    role_order_map = {'OTIC': 1, 'Scrub': 2, 'Recovery': 3, 'Runner': 4, 'Room': 5, 'None': 6}
+                    sorted_day = sorted(day_list, key=lambda x: (shift_order_map.get(x['shift'], 9), role_order_map.get(x['role'], 9), x['nurse_id']))
+                    
+                    shift_name_map = {
+                        'A': 'A 更 (早班 07:00-15:00)',
+                        'Day': 'Day 更 (日間常規 09:00-17:00)',
+                        'P': 'P 更 (午班 13:00-21:00)',
+                        'N': 'N 更 (夜班 21:00-07:00)',
+                        'O': 'O 更 (例假 Day Off)'
+                    }
+                    role_label_map = {
+                        'OTIC': 'OTIC (手術室主管 / In-Charge)',
+                        'Scrub': 'Scrub (洗手護士)',
+                        'Recovery': 'Recovery (復甦室護士)',
+                        'Runner': 'Runner (巡迴護士)',
+                        'Room': 'Room (手術室/產房護士)',
+                        'None': 'Day Off (例假休息)'
+                    }
+                    hours_map = {
+                        'A': '07:00 - 15:00',
+                        'Day': '09:00 - 17:00',
+                        'P': '13:00 - 21:00',
+                        'N': '21:00 - 07:00 (+1)',
+                        'O': '全日休假'
+                    }
+                    
+                    table_rows = []
+                    for itm in sorted_day:
+                        table_rows.append({
+                            "班別 (Shift)": shift_name_map.get(itm['shift'], itm['shift']),
+                            "執勤時段 (Hours)": hours_map.get(itm['shift'], ''),
+                            "崗位職責 (Role / Duty in Charge)": role_label_map.get(itm['role'], itm['role']),
+                            "護士姓名 (Nurse Name)": itm['name'],
+                            "資歷能力 (Capability)": itm['cap']
+                        })
+                    st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
         else:
             st.info("管理員尚未發布最新月份的排班表。")
 
@@ -161,29 +290,92 @@ elif selected_user == "Admin (Ward Manager)":
         with col2:
             plan_month = st.selectbox("排班月份：", list(range(1, 13)), index=9)
             
+        _, max_day_admin = calendar.monthrange(plan_year, plan_month)
+
+        # ----------------------------------------------------
+        # 管理員手動指派功能 (支援單日各更次及連續長夜班 Long Night)
+        # ----------------------------------------------------
+        with st.expander("➕ 管理員手動指派護士更次 / 連續長夜班 (Admin Manual Request & Long Night)", expanded=False):
+            st.markdown("管理員可在此直接為任何護士指定班別或長夜班安排：")
+            col_ad1, col_ad2 = st.columns(2)
+            with col_ad1:
+                adm_target_nurse = st.selectbox("指定護士姓名：", nurse_names, key="adm_n_sel")
+            with col_ad2:
+                adm_selected_shift = st.selectbox("指定班別 / 長夜安排：", list(ADMIN_SHIFT_OPTIONS.keys()), key="adm_s_sel")
+                
+            adm_shift_code = ADMIN_SHIFT_OPTIONS[adm_selected_shift]
+            
+            if adm_shift_code == "LONG_NIGHT":
+                st.info("🌙 您選擇了【指定連續長夜班 (Long Night)】，請設定該護士連續值夜更的日期區間：")
+                col_d1, col_d2 = st.columns(2)
+                with col_d1:
+                    adm_ln_start = st.selectbox("起始日期 (From Date)：", list(range(1, max_day_admin + 1)), index=0, key="adm_ln_st")
+                with col_d2:
+                    adm_ln_end = st.selectbox("結束日期 (To Date)：", list(range(adm_ln_start, max_day_admin + 1)), index=min(6, max_day_admin - adm_ln_start), key="adm_ln_ed")
+                adm_day_val = adm_ln_start
+                adm_end_val = adm_ln_end
+                label_disp = f"連續長夜班 Long Night ({plan_month}/{adm_ln_start} 至 {plan_month}/{adm_ln_end})"
+            else:
+                adm_day_val = st.selectbox("指定日期 (Date)：", list(range(1, max_day_admin + 1)), index=0, key="adm_single_d")
+                adm_end_val = adm_day_val
+                label_disp = adm_selected_shift
+                
+            adm_reason = st.text_input("備註 / 指派原因 (選填)：", "管理員手動指定", key="adm_rsn")
+            
+            if st.button("確認加入指派清單 (Add Manual Assignment)", key="btn_adm_add"):
+                new_adm_entry = {
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "name": adm_target_nurse,
+                    "year": plan_year,
+                    "month": plan_month,
+                    "day": int(adm_day_val),
+                    "end_day": int(adm_end_val),
+                    "shift": adm_shift_code,
+                    "shift_label": label_disp,
+                    "reason": adm_reason,
+                    "status": "已批准 (管理員指定)",
+                    "admin_created": True
+                }
+                st.session_state.requests_db.append(new_adm_entry)
+                st.success(f"✅ 已成功加入管理員指派：{adm_target_nurse} — {label_disp}")
+                st.rerun()
+
+        # ----------------------------------------------------
+        # 步驟一：審查申請與衝突調解
+        # ----------------------------------------------------
         st.subheader("📋 步驟一：審查申請與衝突調解 (Review & Settle Crashes)")
         curr_reqs = [r for r in st.session_state.requests_db if r["year"] == plan_year and r["month"] == plan_month]
         
         approved_reqs = []
         if curr_reqs:
-            # 依日期優先排序：日期 ➔ 姓名 ➔ 申請班別 ➔ 原因 ➔ 提交時間
-            curr_reqs.sort(key=lambda r: (int(r["day"]), r["name"], r["shift"], r["reason"], r["timestamp"]))
+            curr_reqs.sort(key=lambda r: (int(r["day"]), r["name"], r["shift"], r.get("reason", ""), r["timestamp"]))
             
-            st.markdown("依**日期**排列之申請清單（請勾選批准或駁回）：")
+            st.markdown("依**日期**排列之申請與指定清單（請勾選批准或駁回）：")
             for idx, r in enumerate(curr_reqs):
-                col_a, col_b = st.columns((4, 1))
+                col_a, col_b, col_c = st.columns((4, 1, 1))
                 with col_a:
                     shift_disp = r.get("shift_label", r["shift"])
-                    reason_disp = f" | 原因: {r['reason']}" if r['reason'] else ""
-                    st.write(f"📅 **{r['month']}/{r['day']}日** — **{r['name']}** ：`{shift_disp}`{reason_disp} (提交時間: {r['timestamp']})")
+                    reason_disp = f" | 原因: {r['reason']}" if r.get('reason') else ""
+                    admin_tag = " `[管理員指派]`" if r.get("admin_created") else ""
+                    if r.get("shift") == "LONG_NIGHT":
+                        st.write(f"📅 **{r['month']}/{r['day']}日 至 {r['month']}/{r.get('end_day', r['day'])}日** — **{r['name']}** ：`{shift_disp}`{admin_tag}{reason_disp}")
+                    else:
+                        st.write(f"📅 **{r['month']}/{r['day']}日** — **{r['name']}** ：`{shift_disp}`{admin_tag}{reason_disp}")
                 with col_b:
                     is_app = st.checkbox("批准", value=True, key=f"app_{idx}")
                     if is_app:
                         approved_reqs.append(r)
+                with col_c:
+                    if st.button("刪除", key=f"adm_del_{idx}"):
+                        st.session_state.requests_db.remove(r)
+                        st.rerun()
         else:
-            st.info("該月份目前暫無護士登記特別申請。")
+            st.info("該月份目前暫無任何護士登記申請或管理員指定更次。")
             
         st.markdown("---")
+        # ----------------------------------------------------
+        # 步驟二：生成全月排班表
+        # ----------------------------------------------------
         st.subheader("⚡ 步驟二：生成全月排班表 (Generate Duty Schedule)")
         
         if st.button("🚀 生成排班表 (Generate Schedule)"):
@@ -194,6 +386,16 @@ elif selected_user == "Admin (Ward Manager)":
                 shifts = ['O', 'A', 'P', 'N', 'Day']
                 roles = ['None', 'OTIC', 'Scrub', 'Recovery', 'Runner', 'Room']
                 
+                # 解析所有指定連續長夜班 (Long Night)
+                long_nights = {}
+                for r in approved_reqs:
+                    if r.get("shift") == "LONG_NIGHT":
+                        n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
+                        if n_match:
+                            s_d = int(r["day"]) - 1
+                            e_d = int(r.get("end_day", r["day"])) - 1
+                            long_nights.setdefault(n_match["id"], set()).update(range(s_d, e_d + 1))
+
                 model = cp_model.CpModel()
                 x = {}
                 for n in DEFAULT_NURSES:
@@ -231,16 +433,43 @@ elif selected_user == "Admin (Ward Manager)":
                             elif cap == 'C(Scrub)':
                                 model.Add(x[n['id'], d, s, 'OTIC'] == 0)
 
-                # 3. 每週工時約 44 小時與每週 2 日 Off，每週盡量最多 1 次 Night
+                # 3. 指定連續長夜班 (Long Night) 硬性鎖定
+                for n_id, ln_days in long_nights.items():
+                    for d in ln_days:
+                        model.Add(shift_assigned(n_id, d, 'N') == 1)
+
+                # 4. 每週工時約 44 小時與每週 2 日 Off，每週盡量最多 1 次 Night
                 off_penalties = []
                 weekly_hour_penalties = []
                 night_per_week_penalties = []
+                night_fairness_penalties = []
 
+                # 全月休假均衡 (非長夜護士約 8-9 天例假，上班 22-23 天)
+                min_offs = int(num_days * 2 / 7)
+                max_offs = min_offs + (1 if (num_days * 2) % 7 != 0 else 0)
                 for n in DEFAULT_NURSES:
+                    ln_days = long_nights.get(n['id'], set())
+                    tot_o = sum(x[n['id'], d, 'O', 'None'] for d in days)
+                    total_nights = sum(shift_assigned(n['id'], d, 'N') for d in days)
+                    
+                    if not ln_days:
+                        model.Add(tot_o >= min_offs)
+                        model.Add(tot_o <= max_offs)
+                        # 夜班次數嚴格均衡分攤 (4 至 5 班)
+                        model.Add(total_nights >= 3)
+                        model.Add(total_nights <= 5)
+                        ndiff = model.NewIntVar(-1, 1, f"ndiff_{n['id']}")
+                        model.Add(ndiff == total_nights - 4)
+                        abs_ndiff = model.NewIntVar(0, 1, f"abs_ndiff_{n['id']}")
+                        model.AddAbsEquality(abs_ndiff, ndiff)
+                        night_fairness_penalties.append(abs_ndiff)
+                    else:
+                        # 長夜護士夜班數至少涵蓋長夜指定天數
+                        model.Add(total_nights >= len(ln_days))
+                        model.Add(tot_o >= 6)
+
                     for start in range(0, num_days - 6, 7):
                         window = range(start, start + 7)
-                        
-                        # (a) 每 7 天 2 日 Off
                         w_offs = sum(x[n['id'], d, 'O', 'None'] for d in window)
                         diff_o = model.NewIntVar(-7, 7, f"d_o_{n['id']}_{start}")
                         model.Add(diff_o == w_offs - 2)
@@ -248,7 +477,6 @@ elif selected_user == "Admin (Ward Manager)":
                         model.AddAbsEquality(ad_o, diff_o)
                         off_penalties.append(ad_o)
                         
-                        # (b) 需求 1：每週工時控制在約 44 小時 (A=8, P=8, Day=8, N=10)
                         w_hours = model.NewIntVar(0, 70, f"wh_{n['id']}_{start}")
                         model.Add(w_hours == sum(
                             8 * (shift_assigned(n['id'], d, 'A') + shift_assigned(n['id'], d, 'P') + shift_assigned(n['id'], d, 'Day')) +
@@ -261,31 +489,43 @@ elif selected_user == "Admin (Ward Manager)":
                         model.AddAbsEquality(abs_hdiff, h_diff)
                         weekly_hour_penalties.append(abs_hdiff)
                         
-                        # (c) 需求 2：每週盡量只有 1 次 Night 更
-                        w_nights = sum(shift_assigned(n['id'], d, 'N') for d in window)
-                        extra_nights = model.NewIntVar(0, 7, f"extra_n_{n['id']}_{start}")
-                        model.Add(extra_nights >= w_nights - 1)
-                        night_per_week_penalties.append(extra_nights)
+                        if not ln_days:
+                            w_nights = sum(shift_assigned(n['id'], d, 'N') for d in window)
+                            extra_nights = model.NewIntVar(0, 7, f"extra_n_{n['id']}_{start}")
+                            model.Add(extra_nights >= w_nights - 1)
+                            night_per_week_penalties.append(extra_nights)
 
-                # 4. 交接連續性 (一P接二A, 二P接三A, 四P接五A)
+                # 5. 交接連續性 (一P接二A, 二P接三A, 四P接五A)
                 for d in days[:-1]:
                     w = (first_weekday + d) % 7
                     if w in HANDOVER_DAYS:
                         for n in DEFAULT_NURSES:
                             model.Add(x[n['id'], d, 'P', 'OTIC'] == x[n['id'], d + 1, 'A', 'OTIC'])
 
-                # 5. 夜班過渡管制 (A -> N -> O)
+                # 6. 夜班過渡管制 (O shall always be AN / 嚴格成對落實 A -> N -> O，連續長夜除外)
                 for n in DEFAULT_NURSES:
+                    ln_days = long_nights.get(n['id'], set())
                     for d in days:
                         if d > 0:
-                            model.Add(shift_assigned(n['id'], d, 'N') <= shift_assigned(n['id'], d - 1, 'A'))
-                            model.Add(shift_assigned(n['id'], d - 1, 'N') + shift_assigned(n['id'], d, 'A') <= 1)
-                            model.Add(shift_assigned(n['id'], d - 1, 'N') + shift_assigned(n['id'], d, 'Day') <= 1)
-                            model.Add(shift_assigned(n['id'], d - 1, 'N') + shift_assigned(n['id'], d, 'N') <= 1)
-                        if d > 1:
-                            model.Add(shift_assigned(n['id'], d - 2, 'P') + x[n['id'], d - 1, 'O', 'None'] + shift_assigned(n['id'], d, 'N') <= 2)
+                            # 連續長夜期間，允許 N 接 N；非連續長夜期間，N 前一天必為 A
+                            if d in ln_days and (d - 1) in ln_days:
+                                pass
+                            elif d in ln_days:
+                                pass
+                            else:
+                                model.Add(shift_assigned(n['id'], d, 'N') <= shift_assigned(n['id'], d - 1, 'A'))
+                            
+                            # 出夜必定為 O (除非後一天仍在長夜期間)
+                            if (d - 1) in ln_days and d in ln_days:
+                                pass
+                            else:
+                                model.Add(shift_assigned(n['id'], d - 1, 'N') <= x[n['id'], d, 'O', 'None'])
 
-                # 6. 人手配置
+                        if d > 1:
+                            if d not in ln_days:
+                                model.Add(shift_assigned(n['id'], d - 2, 'P') + x[n['id'], d - 1, 'O', 'None'] + shift_assigned(n['id'], d, 'N') <= 2)
+
+                # 7. 人手配置
                 for d in days:
                     w = (first_weekday + d) % 7
                     # 夜更 (N更) 全組 6 人 (1 APN LWIC + 1 OTIC + 1 Scrub + 2 Room護士)
@@ -314,20 +554,7 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) >= 4)
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) <= 5)
 
-                # 7. 人性化目標與偏好模型
-                # 需求 3：各護士夜班次數嚴格均衡分攤 (每人全月 4 至 5 班)
-                night_fairness_penalties = []
-                for n in DEFAULT_NURSES:
-                    total_nights = sum(shift_assigned(n['id'], d, 'N') for d in days)
-                    model.Add(total_nights >= 4)
-                    model.Add(total_nights <= 5)
-                    ndiff = model.NewIntVar(-1, 1, f"ndiff_{n['id']}")
-                    model.Add(ndiff == total_nights - 4)
-                    abs_ndiff = model.NewIntVar(0, 1, f"abs_ndiff_{n['id']}")
-                    model.AddAbsEquality(abs_ndiff, ndiff)
-                    night_fairness_penalties.append(abs_ndiff)
-
-                # 聚攏雙連休 (O - O)
+                # 8. 人性化偏好聚攏
                 oo_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -336,61 +563,43 @@ elif selected_user == "Admin (Ward Manager)":
                         model.Add(is_oo <= x[n['id'], d + 1, 'O', 'None'])
                         oo_rewards.append(is_oo)
 
-                # 嚴懲單日碎片碎假 (防止 O-P-O-P / O-A-O-A)
                 isolated_off_penalties = []
                 for n in DEFAULT_NURSES:
                     for d in range(1, num_days - 1):
                         is_iso = model.NewBoolVar(f"iso_{n['id']}_{d}")
-                        model.Add(is_iso >= x[n['id'], d, 'O', 'None'] + 
-                                            (1 - x[n['id'], d - 1, 'O', 'None']) + 
-                                            (1 - x[n['id'], d + 1, 'O', 'None']) - 2)
+                        model.Add(is_iso >= x[n['id'], d, 'O', 'None'] 
+                                            - x[n['id'], d - 1, 'O', 'None'] 
+                                            - x[n['id'], d + 1, 'O', 'None'] 
+                                            - shift_assigned(n['id'], d - 1, 'N'))
                         isolated_off_penalties.append(is_iso)
 
-                # A - N - O 閉環成對
-                ano_rewards = []
-                for n in DEFAULT_NURSES:
-                    for d in days[:-1]:
-                        is_ano = model.NewBoolVar(f"ano_{n['id']}_{d}")
-                        model.Add(is_ano <= shift_assigned(n['id'], d, 'N'))
-                        model.Add(is_ano <= x[n['id'], d + 1, 'O', 'None'])
-                        ano_rewards.append(is_ano)
-
-                # P - A - N - O 黃金組合
-                pano_rewards = []
-                for n in DEFAULT_NURSES:
-                    for d in range(2, num_days - 1):
-                        is_pano = model.NewBoolVar(f"pano_{n['id']}_{d}")
-                        model.Add(is_pano <= shift_assigned(n['id'], d - 2, 'P'))
-                        model.Add(is_pano <= shift_assigned(n['id'], d, 'N'))
-                        model.Add(is_pano <= x[n['id'], d + 1, 'O', 'None'])
-                        pano_rewards.append(is_pano)
-
-                # 8. 套用已批准之申請 (支援多選 A or P、Day 及排除不想返之班別)
+                # 9. 套用已批准之單日申請
                 for r in approved_reqs:
-                    n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
-                    if n_match:
-                        d_idx = int(r["day"]) - 1
-                        s_code = r["shift"]
-                        if s_code == "WANT_O":
-                            model.Add(x[n_match['id'], d_idx, 'O', 'None'] == 1)
-                        elif s_code == "WANT_A":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 1)
-                        elif s_code == "WANT_P":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 1)
-                        elif s_code == "WANT_N":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 1)
-                        elif s_code == "WANT_DAY":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 1)
-                        elif s_code == "WANT_AP":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') + shift_assigned(n_match['id'], d_idx, 'P') == 1)
-                        elif s_code == "AVOID_N":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 0)
-                        elif s_code == "AVOID_A":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 0)
-                        elif s_code == "AVOID_P":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 0)
-                        elif s_code == "AVOID_DAY":
-                            model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 0)
+                    if r.get("shift") != "LONG_NIGHT":
+                        n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
+                        if n_match:
+                            d_idx = int(r["day"]) - 1
+                            s_code = r["shift"]
+                            if s_code == "WANT_O":
+                                model.Add(x[n_match['id'], d_idx, 'O', 'None'] == 1)
+                            elif s_code == "WANT_A":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 1)
+                            elif s_code == "WANT_P":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 1)
+                            elif s_code == "WANT_N":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 1)
+                            elif s_code == "WANT_DAY":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 1)
+                            elif s_code == "WANT_AP":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') + shift_assigned(n_match['id'], d_idx, 'P') == 1)
+                            elif s_code == "AVOID_N":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 0)
+                            elif s_code == "AVOID_A":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 0)
+                            elif s_code == "AVOID_P":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 0)
+                            elif s_code == "AVOID_DAY":
+                                model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 0)
 
                 # 目標評分
                 scores = [
@@ -398,10 +607,8 @@ elif selected_user == "Admin (Ward Manager)":
                     -10 * sum(weekly_hour_penalties),
                     -60 * sum(night_per_week_penalties),
                     -30 * sum(night_fairness_penalties),
-                    -35 * sum(isolated_off_penalties),
-                    30 * sum(oo_rewards),
-                    40 * sum(ano_rewards),
-                    50 * sum(pano_rewards)
+                    -40 * sum(isolated_off_penalties),
+                    30 * sum(oo_rewards)
                 ]
                 for n in DEFAULT_NURSES:
                     for d in days:
@@ -431,13 +638,15 @@ elif selected_user == "Admin (Ward Manager)":
                     }
                     header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
                     weekend_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+                    summary_hdr_fill = PatternFill(start_color="274E13", end_color="274E13", fill_type="solid")
                     border = Border(left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
                                     top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9'))
                     
                     ws.cell(row=1, column=1, value=f"O&G 手術室及病房護士排班表 ({plan_year}年{plan_month}月)").font = Font(name="Arial", size=14, bold=True, color="1F497D")
                     weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
                     day_headers = [f"{plan_month}/{d+1}\n({weekday_cn[(first_weekday+d)%7]})" for d in days]
-                    headers = ["編號", "資歷能力", "護士姓名"] + day_headers + ["總上班日", "總放假日"]
+                    summary_headers = ["總上班日", "總 A 班", "總 P 班", "總 N 班", "總 Day 班", "總 O 班"]
+                    headers = ["編號", "資歷能力", "護士姓名"] + day_headers + summary_headers
                     
                     header_row_index = 3
                     ws.row_dimensions[header_row_index].height = 28
@@ -446,9 +655,19 @@ elif selected_user == "Admin (Ward Manager)":
                         cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
                         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                         is_wk = (4 <= col_idx <= len(days) + 3) and ((first_weekday + col_idx - 4) % 7 in WEEKEND_DAYS)
-                        cell.fill = weekend_fill if is_wk else header_fill
+                        is_summary = col_idx > len(days) + 3
+                        if is_summary:
+                            cell.fill = summary_hdr_fill
+                        elif is_wk:
+                            cell.fill = weekend_fill
+                        else:
+                            cell.fill = header_fill
                         
                     res_rows = []
+                    daily_details_dict = {}
+                    for d in days:
+                        daily_details_dict[d + 1] = []
+
                     for r_idx, n in enumerate(DEFAULT_NURSES, 4):
                         ws.row_dimensions[r_idx].height = 22
                         ws.cell(row=r_idx, column=1, value=n['id']).font = Font(name="Arial", size=9, bold=True)
@@ -464,7 +683,7 @@ elif selected_user == "Admin (Ward Manager)":
                         ws.cell(row=r_idx, column=3).border = border
                         
                         row_dict = {"編號": n["id"], "資格": n["cap"], "姓名": n["name"]}
-                        work_c, off_c = 0, 0
+                        work_c, a_c, p_c, n_c, day_c, off_c = 0, 0, 0, 0, 0, 0
                         for d in days:
                             cell = ws.cell(row=r_idx, column=d + 4)
                             cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -477,6 +696,15 @@ elif selected_user == "Admin (Ward Manager)":
                                     if solver.Value(x[n['id'], d, s, r]) == 1:
                                         s_assigned, r_assigned = s, r
                                         break
+                            
+                            daily_details_dict[d + 1].append({
+                                "nurse_id": n["id"],
+                                "name": n["name"],
+                                "cap": n["cap"],
+                                "shift": s_assigned,
+                                "role": r_assigned
+                            })
+
                             if s_assigned == 'O':
                                 cell.value, cell.fill = "O", shift_fills['O']
                                 row_dict[f"{plan_month}/{d+1}"] = "O"
@@ -487,15 +715,58 @@ elif selected_user == "Admin (Ward Manager)":
                                 cell.value, cell.fill = disp_val, shift_fills.get(s_assigned, shift_fills['O'])
                                 row_dict[f"{plan_month}/{d+1}"] = f"{s_assigned}{role_tag}"
                                 work_c += 1
+                                if s_assigned == 'A':
+                                    a_c += 1
+                                elif s_assigned == 'P':
+                                    p_c += 1
+                                elif s_assigned == 'N':
+                                    n_c += 1
+                                elif s_assigned == 'Day':
+                                    day_c += 1
                                 
-                        ws.cell(row=r_idx, column=len(days)+4, value=work_c).alignment = Alignment(horizontal='center', vertical='center')
-                        ws.cell(row=r_idx, column=len(days)+4).font = Font(name="Arial", size=9, bold=True)
-                        ws.cell(row=r_idx, column=len(days)+4).border = border
-                        
-                        ws.cell(row=r_idx, column=len(days)+5, value=off_c).alignment = Alignment(horizontal='center', vertical='center')
-                        ws.cell(row=r_idx, column=len(days)+5).font = Font(name="Arial", size=9, bold=True)
-                        ws.cell(row=r_idx, column=len(days)+5).border = border
+                        row_dict["總上班日"] = work_c
+                        row_dict["總 A 班"] = a_c
+                        row_dict["總 P 班"] = p_c
+                        row_dict["總 N 班"] = n_c
+                        row_dict["總 Day 班"] = day_c
+                        row_dict["總 O 班"] = off_c
+
+                        summary_vals = [work_c, a_c, p_c, n_c, day_c, off_c]
+                        for s_idx, val in enumerate(summary_vals):
+                            col_num = len(days) + 4 + s_idx
+                            c_cell = ws.cell(row=r_idx, column=col_num, value=val)
+                            c_cell.alignment = Alignment(horizontal='center', vertical='center')
+                            c_cell.font = Font(name="Arial", size=9, bold=True)
+                            c_cell.border = border
+
                         res_rows.append(row_dict)
+
+                    # 底部每日加總列
+                    bot_row = len(DEFAULT_NURSES) + 4
+                    ws.row_dimensions[bot_row].height = 24
+                    ws.cell(row=bot_row, column=1, value="").border = border
+                    ws.cell(row=bot_row, column=2, value="").border = border
+                    lbl_cell = ws.cell(row=bot_row, column=3, value="每日當值人數總計")
+                    lbl_cell.font = Font(name="Arial", size=9, bold=True, color="1F497D")
+                    lbl_cell.alignment = Alignment(horizontal='center', vertical='center')
+                    lbl_cell.border = border
+
+                    for d in days:
+                        col_ltr = get_column_letter(d + 4)
+                        day_cell = ws.cell(row=bot_row, column=d + 4, value=f'=COUNTIF({col_ltr}4:{col_ltr}{bot_row-1}, "<>O")')
+                        day_cell.font = Font(name="Arial", size=9, bold=True)
+                        day_cell.alignment = Alignment(horizontal='center', vertical='center')
+                        day_cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+                        day_cell.border = border
+
+                    for s_idx in range(len(summary_headers)):
+                        col_num = len(days) + 4 + s_idx
+                        col_ltr = get_column_letter(col_num)
+                        tot_cell = ws.cell(row=bot_row, column=col_num, value=f'=SUM({col_ltr}4:{col_ltr}{bot_row-1})')
+                        tot_cell.font = Font(name="Arial", size=9, bold=True)
+                        tot_cell.alignment = Alignment(horizontal='center', vertical='center')
+                        tot_cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+                        tot_cell.border = border
 
                     ws.column_dimensions['A'].width = 6
                     ws.column_dimensions['B'].width = 12
@@ -503,20 +774,136 @@ elif selected_user == "Admin (Ward Manager)":
                     for d in days:
                         ws.column_dimensions[get_column_letter(d + 4)].width = 8
                     ws.column_dimensions[get_column_letter(len(days) + 4)].width = 10
-                    ws.column_dimensions[get_column_letter(len(days) + 5)].width = 10
+                    ws.column_dimensions[get_column_letter(len(days) + 5)].width = 9
+                    ws.column_dimensions[get_column_letter(len(days) + 6)].width = 9
+                    ws.column_dimensions[get_column_letter(len(days) + 7)].width = 9
+                    ws.column_dimensions[get_column_letter(len(days) + 8)].width = 10
+                    ws.column_dimensions[get_column_letter(len(days) + 9)].width = 9
                     
                     df_out = pd.DataFrame(res_rows)
                     st.session_state.generated_schedule = df_out
-                    st.dataframe(df_out, use_container_width=True)
+                    st.session_state.daily_details = daily_details_dict
+                    st.session_state.plan_meta = {"year": plan_year, "month": plan_month, "first_weekday": first_weekday, "num_days": num_days}
                     
+                    # 儲存 Excel
                     output = io.BytesIO()
                     wb.save(output)
+                    st.session_state.excel_data = output.getvalue()
                     
-                    st.download_button(
-                        label="📥 下載格式化 Excel 班表 (Download Excel)",
-                        data=output.getvalue(),
-                        file_name=f"OG_Duty_Schedule_{plan_year}_{plan_month:02d}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
                 else:
-                    st.error("❌ 運算未能找到可行解，請檢查是否有過多護士請假衝突。")
+                    st.error("❌ 運算未能找到可行解，請檢查是否有過多護士請假或長夜安排衝突。")
+
+        # ----------------------------------------------------
+        # 班表展示區 (含特定班別篩選 & 第二張每日崗位職責詳情表)
+        # ----------------------------------------------------
+        if st.session_state.generated_schedule is not None:
+            st.markdown("---")
+            st.subheader("📊 總排班表檢視 (Monthly Schedule View)")
+            
+            # 篩選特定班別選項
+            col_f1, col_f2 = st.columns((1, 2))
+            with col_f1:
+                adm_view_mode = st.radio("班表顯示模式 (Display Mode)：", ["全部班別 (All Shifts)", "只顯示特定班別 (Filter by Shift)"], index=0, horizontal=True, key="adm_vm")
+            
+            df_display_admin = st.session_state.generated_schedule.copy()
+            if adm_view_mode == "只顯示特定班別 (Filter by Shift)":
+                with col_f2:
+                    adm_target_shift = st.selectbox("選擇要單獨檢視的班別：", ["A 更 (早班)", "P 更 (午班)", "N 更 (夜班)", "Day 更 (日間常規班)", "O 更 (例假/休假)"], key="adm_flt_s")
+                prefix_map_adm = {"A 更 (早班)": "A", "P 更 (午班)": "P", "N 更 (夜班)": "N", "Day 更 (日間常規班)": "Day", "O 更 (例假/休假)": "O"}
+                t_code = prefix_map_adm[adm_target_shift]
+                day_cols_adm = [c for c in df_display_admin.columns if "/" in c]
+                for c in day_cols_adm:
+                    df_display_admin[c] = df_display_admin[c].apply(lambda v: v if (str(v).startswith(t_code) and (t_code != "A" or not str(v).startswith("AVOID"))) else "-")
+
+            st.dataframe(df_display_admin, use_container_width=True)
+
+            if "excel_data" in st.session_state:
+                st.download_button(
+                    label="📥 下載格式化 Excel 完整班表 (Download Excel)",
+                    data=st.session_state.excel_data,
+                    file_name=f"OG_Duty_Schedule_{plan_year}_{plan_month:02d}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+            # ----------------------------------------------------
+            # 第二張表格：選擇指定日期的每日執勤人員與各崗位職責詳情
+            # ----------------------------------------------------
+            st.markdown("---")
+            st.subheader("📋 第二張表：指定日期執勤人員與各崗位職責詳情 (Daily Roster & Role In-Charge Details)")
+            
+            meta = st.session_state.plan_meta
+            weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
+            
+            selected_inspect_day = st.selectbox(
+                "📅 請選擇欲檢視的日期 (Select Date to View Details)：",
+                list(range(1, meta["num_days"] + 1)),
+                index=0,
+                format_func=lambda d: f"{meta['month']}月{d}日 (星期{weekday_cn[(meta['first_weekday'] + d - 1) % 7]})",
+                key="adm_sel_inspect_day"
+            )
+            
+            day_records = st.session_state.daily_details.get(selected_inspect_day, [])
+            if day_records:
+                shift_order_map = {'A': 1, 'Day': 2, 'P': 3, 'N': 4, 'O': 5}
+                role_order_map = {'OTIC': 1, 'Scrub': 2, 'Recovery': 3, 'Runner': 4, 'Room': 5, 'None': 6}
+                sorted_records = sorted(day_records, key=lambda x: (shift_order_map.get(x['shift'], 9), role_order_map.get(x['role'], 9), x['nurse_id']))
+                
+                shift_name_map = {
+                    'A': 'A 更 (早班 07:00-15:00)',
+                    'Day': 'Day 更 (日間常規 09:00-17:00)',
+                    'P': 'P 更 (午班 13:00-21:00)',
+                    'N': 'N 更 (夜班 21:00-07:00)',
+                    'O': 'O 更 (例假 Day Off)'
+                }
+                role_label_map = {
+                    'OTIC': '🌟 OTIC (產房手術室主管 / Duty In Charge)',
+                    'Scrub': '🩺 Scrub (洗手手術護士)',
+                    'Recovery': '🛏️ Recovery (復甦室監護護士)',
+                    'Runner': '🏃 Runner (巡迴護士)',
+                    'Room': '🚪 Room (手術室/產房護士)',
+                    'None': '🏖️ Day Off (例假休息)'
+                }
+                hours_map = {
+                    'A': '07:00 - 15:00',
+                    'Day': '09:00 - 17:00',
+                    'P': '13:00 - 21:00',
+                    'N': '21:00 - 07:00 (+1)',
+                    'O': '全日休假'
+                }
+                
+                # 計算當日各班別在勤人數統計
+                a_nurses = [r['name'] for r in day_records if r['shift'] == 'A']
+                p_nurses = [r['name'] for r in day_records if r['shift'] == 'P']
+                n_nurses = [r['name'] for r in day_records if r['shift'] == 'N']
+                day_nurses = [r['name'] for r in day_records if r['shift'] == 'Day']
+                o_nurses = [r['name'] for r in day_records if r['shift'] == 'O']
+                
+                kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+                kpi1.metric("早班 (A 更)", f"{len(a_nurses)} 人")
+                kpi2.metric("午班 (P 更)", f"{len(p_nurses)} 人")
+                kpi3.metric("夜班 (N 更)", f"{len(n_nurses)} 人")
+                kpi4.metric("日間常規 (Day)", f"{len(day_nurses)} 人")
+                kpi5.metric("例假 (Off)", f"{len(o_nurses)} 人")
+                
+                inspect_table = []
+                for itm in sorted_records:
+                    inspect_table.append({
+                        "班別 (Shift)": shift_name_map.get(itm['shift'], itm['shift']),
+                        "執勤時段 (Hours)": hours_map.get(itm['shift'], ''),
+                        "崗位職責 (Role / Duty in Charge)": role_label_map.get(itm['role'], itm['role']),
+                        "護士姓名 (Nurse Name)": itm['name'],
+                        "資歷能力 (Capability)": itm['cap']
+                    })
+                
+                df_day_inspect = pd.DataFrame(inspect_table)
+                st.dataframe(df_day_inspect, use_container_width=True)
+                
+                # 提供單日當值表 CSV 下載
+                csv_day = df_day_inspect.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label=f"📥 下載 {meta['month']}月{selected_inspect_day}日 當日執勤人員詳情 (CSV)",
+                    data=csv_day,
+                    file_name=f"OG_Duty_Detail_{meta['year']}_{meta['month']:02d}_{selected_inspect_day:02d}.csv",
+                    mime="text/csv",
+                    key="btn_dl_day_csv"
+                )
