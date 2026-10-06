@@ -167,26 +167,76 @@ user_options = ["請選擇您的身份...", "Admin (Ward Manager)"] + nurse_name
 selected_user = st.selectbox("👤 請選擇使用者身份 (Select User)：", user_options, index=0)
 
 # ==========================================
+# 輔助函式：解析班別申請代碼 (Parse Shift Request)
+# ==========================================
+def parse_shift_request(shift_str):
+    """
+    解析班別申請代碼為 (intent, shift_list)
+    支援新格式 (如 WANT:A/P, AVOID:N) 與舊格式 (如 WANT_A, WANT_AP, AVOID_N, LONG_NIGHT)
+    """
+    if not shift_str:
+        return "WANT", []
+    if shift_str == "LONG_NIGHT":
+        return "LONG_NIGHT", ["N"]
+    if ":" in shift_str:
+        intent_raw, combo_raw = shift_str.split(":", 1)
+        intent = intent_raw.strip().upper()
+        combo = combo_raw.strip()
+        shifts = [s.strip() for s in combo.split("/") if s.strip()]
+        return intent, shifts
+    
+    legacy_map = {
+        "WANT_O": ("WANT", ["O"]),
+        "WANT_A": ("WANT", ["A"]),
+        "WANT_P": ("WANT", ["P"]),
+        "WANT_N": ("WANT", ["N"]),
+        "WANT_DAY": ("WANT", ["Day"]),
+        "WANT_AP": ("WANT", ["A", "P"]),
+        "AVOID_N": ("AVOID", ["N"]),
+        "AVOID_A": ("AVOID", ["A"]),
+        "AVOID_P": ("AVOID", ["P"]),
+        "AVOID_DAY": ("AVOID", ["Day"]),
+    }
+    if shift_str in legacy_map:
+        return legacy_map[shift_str]
+        
+    if shift_str.startswith("WANT_"):
+        return "WANT", [shift_str.replace("WANT_", "")]
+    if shift_str.startswith("AVOID_"):
+        return "AVOID", [shift_str.replace("AVOID_", "")]
+    return "WANT", [shift_str]
+
+def is_requesting_off(shift_code):
+    intent, shifts = parse_shift_request(shift_code)
+    return intent == "WANT" and "O" in shifts
+
+# ==========================================
 # 輔助函式：護士申請限制驗證 (每週最多2項、週末最多1個O)
 # ==========================================
 def validate_nurse_request(existing_reqs, nurse_name, year, month, day, shift_code):
     dt = datetime.date(year, month, day)
-    w_key = dt.isocalendar()[:2]  # (year, week_num)
+    w_cal = dt.isocalendar()
+    w_key = (w_cal.year, w_cal.week)
     iso_weekday = dt.isoweekday()  # 1=Mon, ..., 6=Sat, 7=Sun
     
     nurse_reqs = [r for r in existing_reqs if r["name"] == nurse_name and r["year"] == year and r["month"] == month]
     
     # 計算該週 (週一至週日) 已有的申請數量 (扣除同日更替)
-    same_week_reqs = [r for r in nurse_reqs if datetime.date(r["year"], r["month"], r["day"]).isocalendar()[:2] == w_key and r["day"] != day]
+    same_week_reqs = [
+        r for r in nurse_reqs 
+        if (datetime.date(r["year"], r["month"], r["day"]).isocalendar().year, 
+            datetime.date(r["year"], r["month"], r["day"]).isocalendar().week) == w_key 
+        and r["day"] != day
+    ]
     
     if len(same_week_reqs) >= 2:
         return False, f"每位護士每週（星期一至星期日）最多只可提交 2 項特別申請！該週您已有 {len(same_week_reqs)} 項登記。"
         
-    # 週末只可申請 1 個 O (星期六及日不能同時為 O)
-    if shift_code == "WANT_O" and iso_weekday in (6, 7):
+    # 週末只可申請 1 個 O (星期六及日不能同時要求包含放假 O)
+    if is_requesting_off(shift_code) and iso_weekday in (6, 7):
         for r in same_week_reqs:
             r_dt = datetime.date(r["year"], r["month"], r["day"])
-            if r_dt.isoweekday() in (6, 7) and r["shift"] == "WANT_O":
+            if r_dt.isoweekday() in (6, 7) and is_requesting_off(r["shift"]):
                 return False, "每週週末（星期六及日）最多只可申請 1 天例假 (Day Off)，不可同時申請星期六與星期日放假！"
                 
     return True, ""
@@ -214,38 +264,115 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
             _, max_day = calendar.monthrange(req_year, req_month)
             req_day = st.selectbox("日期 (Date)", list(range(1, max_day + 1)), index=0, key="n_da")
             
-        selected_shift_label = st.selectbox("偏好更次 / 休假意願 (Preferred / Avoid Shift)：", list(NURSE_SHIFT_OPTIONS.keys()))
-        shift_code = NURSE_SHIFT_OPTIONS[selected_shift_label]
+        st.markdown("#### 選擇更次申請意向與班別組合 (Select Shift Preference)")
+        req_intent = st.radio(
+            "1️⃣ 選擇申請意向 (Select Intent)：",
+            ("🟢 想返 / 想放 (Want - 必須排所選其中一個班別)", "🔴 不想返 / 避開 (Don't Want - 絕不排所選班別)"),
+            horizontal=True,
+            key="n_intent"
+        )
+        
+        st.markdown("**2️⃣ 選擇班別組合 (Select Shift Combination — 可自由組合 A, P, N, O, Day)：**")
+        
+        if "n_combo_widget" not in st.session_state:
+            st.session_state["n_combo_widget"] = ["A"]
+
+        st.caption("⚡ 常用快捷預設（點擊後直接套用，亦可於下方多選框自由勾選或增減）：")
+        b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
+        with b1:
+            if st.button("A 班", key="btn_p_a"):
+                st.session_state["n_combo_widget"] = ["A"]
+                st.rerun()
+        with b2:
+            if st.button("P 班", key="btn_p_p"):
+                st.session_state["n_combo_widget"] = ["P"]
+                st.rerun()
+        with b3:
+            if st.button("N 班", key="btn_p_n"):
+                st.session_state["n_combo_widget"] = ["N"]
+                st.rerun()
+        with b4:
+            if st.button("放假 O", key="btn_p_o"):
+                st.session_state["n_combo_widget"] = ["O"]
+                st.rerun()
+        with b5:
+            if st.button("A 或 P", key="btn_p_ap"):
+                st.session_state["n_combo_widget"] = ["A", "P"]
+                st.rerun()
+        with b6:
+            if st.button("A 或 O", key="btn_p_ao"):
+                st.session_state["n_combo_widget"] = ["A", "O"]
+                st.rerun()
+        with b7:
+            if st.button("A/P/O", key="btn_p_apo"):
+                st.session_state["n_combo_widget"] = ["A", "P", "O"]
+                st.rerun()
+
+        shift_choices = ("A", "P", "N", "O", "Day")
+        shift_desc = {
+            "A": "A (早班 07:30-15:30)",
+            "P": "P (午班 13:30-21:15)",
+            "N": "N (夜班 21:00-07:45)",
+            "O": "O (例假/放假)",
+            "Day": "Day (日間常規班 09:00-17:00)"
+        }
+        
+        selected_shifts = st.multiselect(
+            "班別多選清單 (點選下拉加入或點 ✕ 移除班別)：",
+            options=shift_choices,
+            format_func=lambda s: shift_desc.get(s, s),
+            key="n_combo_widget"
+        )
+        
+        is_want = req_intent.startswith("🟢")
+        if not selected_shifts:
+            st.warning("⚠️ 請至少選擇一個班別！")
+            shift_code = ""
+            selected_shift_label = ""
+        else:
+            intent_type = "WANT" if is_want else "AVOID"
+            combo_code = "/".join(selected_shifts)
+            shift_code = f"{intent_type}:{combo_code}"
+            
+            if is_want:
+                selected_shift_label = f"🟢 想返/放：{' 或 '.join(selected_shifts)}"
+                st.success(f"📋 **申請意願確認**：{req_year}年{req_month}月{req_day}日【必須排入】**{' 或 '.join(selected_shifts)}** 其中之一（不排其他班別）。")
+            else:
+                selected_shift_label = f"🔴 不想返：{' 及 '.join(selected_shifts)}"
+                st.error(f"📋 **申請意願確認**：{req_year}年{req_month}月{req_day}日【避開】**{' 及 '.join(selected_shifts)}**（當天絕不可排這些班別）。")
         
         req_reason = st.text_input("備註原因 (選填)：", "")
         
         if st.button("提交申請 (Submit Request)"):
-            is_valid, err_msg = validate_nurse_request(st.session_state.requests_db, selected_user, req_year, req_month, int(req_day), shift_code)
-            if not is_valid:
-                st.error(f"❌ 登記失敗：{err_msg}")
+            if not shift_code:
+                st.error("❌ 登記失敗：請至少選擇一個班別！")
             else:
-                # 移除同一天的舊申請 (如果存在)
-                st.session_state.requests_db = [
-                    r for r in st.session_state.requests_db
-                    if not (r["name"] == selected_user and r["year"] == req_year and r["month"] == req_month and r["day"] == int(req_day))
-                ]
-                new_entry = {
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "name": selected_user,
-                    "year": req_year,
-                    "month": req_month,
-                    "day": int(req_day),
-                    "end_day": int(req_day),
-                    "shift": shift_code,
-                    "shift_label": selected_shift_label,
-                    "reason": req_reason,
-                    "status": "待審核",
-                    "admin_created": False
-                }
-                st.session_state.requests_db.append(new_entry)
-                save_requests_to_db(st.session_state.requests_db)
-                st.success(f"✅ 已成功登記並儲存至試算表：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
-                st.rerun()
+                is_valid, err_msg = validate_nurse_request(st.session_state.requests_db, selected_user, req_year, req_month, int(req_day), shift_code)
+                if not is_valid:
+                    st.error(f"❌ 登記失敗：{err_msg}")
+                else:
+                    # 移除同一天的舊申請 (如果存在)
+                    st.session_state.requests_db = [
+                        r for r in st.session_state.requests_db
+                        if not (r["name"] == selected_user and r["year"] == req_year and r["month"] == req_month and r["day"] == int(req_day))
+                    ]
+                    new_entry = {
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "name": selected_user,
+                        "year": req_year,
+                        "month": req_month,
+                        "day": int(req_day),
+                        "end_day": int(req_day),
+                        "shift": shift_code,
+                        "shift_label": selected_shift_label,
+                        "reason": req_reason,
+                        "status": "待審核",
+                        "admin_created": False
+                    }
+                    st.session_state.requests_db.append(new_entry)
+                    save_requests_to_db(st.session_state.requests_db)
+                    st.success(f"✅ 已成功登記並儲存至試算表：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
+                    st.rerun()
             
         st.markdown("---")
         st.subheader("您已提交的申請記錄：")
@@ -410,16 +537,14 @@ elif selected_user == "Admin (Ward Manager)":
         # 管理員手動指派功能 (支援單日各更次及連續長夜班 Long Night)
         # ----------------------------------------------------
         with st.expander("➕ 管理員手動指派護士更次 / 連續長夜班 (Admin Manual Request & Long Night)", expanded=False):
-            st.markdown("管理員可在此直接為任何護士指定班別或長夜班安排：")
+            st.markdown("管理員可在此直接為任何護士指定班別、自訂班別組合或長夜班安排：")
             col_ad1, col_ad2 = st.columns(2)
             with col_ad1:
                 adm_target_nurse = st.selectbox("指定護士姓名：", nurse_names, key="adm_n_sel")
             with col_ad2:
-                adm_selected_shift = st.selectbox("指定班別 / 長夜安排：", list(ADMIN_SHIFT_OPTIONS.keys()), key="adm_s_sel")
+                adm_req_type = st.radio("指派更次類型 (Assignment Type)：", ["🌙 指定連續長夜班 (Long Night)", "🟢 指定想返/想放組合 (Want)", "🔴 指定避開/不排組合 (Avoid)"], horizontal=True, key="adm_rtype_sel")
                 
-            adm_shift_code = ADMIN_SHIFT_OPTIONS[adm_selected_shift]
-            
-            if adm_shift_code == "LONG_NIGHT":
+            if adm_req_type.startswith("🌙"):
                 st.info("🌙 您選擇了【指定連續長夜班 (Long Night)】，請設定該護士連續值夜更的日期區間：")
                 col_d1, col_d2 = st.columns(2)
                 with col_d1:
@@ -428,35 +553,70 @@ elif selected_user == "Admin (Ward Manager)":
                     adm_ln_end = st.selectbox("結束日期 (To Date)：", list(range(adm_ln_start, max_day_admin + 1)), index=min(6, max_day_admin - adm_ln_start), key="adm_ln_ed")
                 adm_day_val = adm_ln_start
                 adm_end_val = adm_ln_end
+                adm_shift_code = "LONG_NIGHT"
                 label_disp = f"連續長夜班 Long Night ({plan_month}/{adm_ln_start} 至 {plan_month}/{adm_ln_end})"
             else:
                 adm_day_val = st.selectbox("指定日期 (Date)：", list(range(1, max_day_admin + 1)), index=0, key="adm_single_d")
                 adm_end_val = adm_day_val
-                label_disp = adm_selected_shift
+                
+                shift_choices = ("A", "P", "N", "O", "Day")
+                shift_desc = {
+                    "A": "A (早班)",
+                    "P": "P (午班)",
+                    "N": "N (夜班)",
+                    "O": "O (例假/放假)",
+                    "Day": "Day (日間常規班)"
+                }
+                
+                is_adm_want = adm_req_type.startswith("🟢")
+                adm_default = ["A"] if is_adm_want else ["N"]
+                if "adm_combo_widget" not in st.session_state:
+                    st.session_state["adm_combo_widget"] = adm_default
+                    
+                adm_shifts = st.multiselect(
+                    "指定班別組合 (可複選 A, P, N, O, Day 任意組合)：",
+                    options=shift_choices,
+                    format_func=lambda s: shift_desc.get(s, s),
+                    key="adm_combo_widget"
+                )
+                
+                if not adm_shifts:
+                    st.warning("⚠️ 請至少選擇一個班別！")
+                    adm_shift_code = ""
+                    label_disp = ""
+                else:
+                    intent_type = "WANT" if is_adm_want else "AVOID"
+                    combo_str = "/".join(adm_shifts)
+                    adm_shift_code = f"{intent_type}:{combo_str}"
+                    if is_adm_want:
+                        label_disp = f"🟢 管理員指定想返/放：{' 或 '.join(adm_shifts)}"
+                    else:
+                        label_disp = f"🔴 管理員指定避開：{' 及 '.join(adm_shifts)}"
                 
             adm_reason = st.text_input("備註 / 指派原因 (選填)：", "管理員手動指定", key="adm_rsn")
             
             if st.button("確認加入指派清單 (Add Manual Assignment)", key="btn_adm_add"):
-                new_adm_entry = {
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "name": adm_target_nurse,
-                    "year": plan_year,
-                    "month": plan_month,
-                    "day": int(adm_day_val),
-                    "end_day": int(adm_end_val),
-                    "shift": adm_shift_code,
-                    "shift_label": label_disp,
-                    "reason": adm_reason,
-                    "status": "已批准 (管理員指定)",
-                    "admin_created": True
-                }
-                st.session_state.requests_db.append(new_adm_entry)
-                save_requests_to_db(st.session_state.requests_db)
-                st.success(f"✅ 已成功加入並儲存管理員指派：{adm_target_nurse} — {label_disp}")
-                st.rerun()
+                if not adm_shift_code:
+                    st.error("❌ 請先選擇有效的班別組合！")
+                else:
+                    new_adm_entry = {
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "name": adm_target_nurse,
+                        "year": plan_year,
+                        "month": plan_month,
+                        "day": int(adm_day_val),
+                        "end_day": int(adm_end_val),
+                        "shift": adm_shift_code,
+                        "shift_label": label_disp,
+                        "reason": adm_reason,
+                        "status": "已批准 (管理員指定)",
+                        "admin_created": True
+                    }
+                    st.session_state.requests_db.append(new_adm_entry)
+                    save_requests_to_db(st.session_state.requests_db)
+                    st.success(f"✅ 已成功加入並儲存管理員指派：{adm_target_nurse} — {label_disp}")
+                    st.rerun()
 
-        # ----------------------------------------------------
-        # 步驟一：審查申請與衝突調解
         # ----------------------------------------------------
         st.subheader("📋 步驟一：審查申請與衝突調解 (Review & Settle Crashes)")
         curr_reqs = [r for r in st.session_state.requests_db if r["year"] == plan_year and r["month"] == plan_month]
@@ -571,7 +731,6 @@ elif selected_user == "Admin (Ward Manager)":
                     if not ln_days:
                         model.Add(tot_o >= min_offs)
                         model.Add(tot_o <= max_offs)
-                        # 夜班次數嚴格均衡分攤 (4 至 5 班)
                         model.Add(total_nights >= 3)
                         model.Add(total_nights <= 5)
                         ndiff = model.NewIntVar(-1, 1, f"ndiff_{n['id']}")
@@ -580,7 +739,6 @@ elif selected_user == "Admin (Ward Manager)":
                         model.AddAbsEquality(abs_ndiff, ndiff)
                         night_fairness_penalties.append(abs_ndiff)
                     else:
-                        # 長夜護士夜班數至少涵蓋長夜指定天數
                         model.Add(total_nights >= len(ln_days))
                         model.Add(tot_o >= 6)
 
@@ -667,7 +825,7 @@ elif selected_user == "Admin (Ward Manager)":
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) >= 4)
                             model.Add(sum(x[n['id'], d, s, 'Room'] for n in DEFAULT_NURSES) <= 5)
 
-                # 8. 人性化偏好聚攏
+                # 8. 人性化偏好聚攏與連續順暢班別優化 (Ergonomic Continuous Shift Optimization)
                 oo_rewards = []
                 for n in DEFAULT_NURSES:
                     for d in days[:-1]:
@@ -686,42 +844,120 @@ elif selected_user == "Admin (Ward Manager)":
                                             - shift_assigned(n['id'], d - 1, 'N'))
                         isolated_off_penalties.append(is_iso)
 
-                # 9. 套用已批准之單日申請
+                # 連續順暢班別獎勵 (PA, PAN, PAO, PAPA 等) 及 避免連續相同班別 (AAA, PPP)
+                pa_rewards = []
+                pan_rewards = []
+                pao_rewards = []
+                papa_rewards = []
+                aaa_penalties = []
+                ppp_penalties = []
+
+                for n in DEFAULT_NURSES:
+                    nid = n['id']
+                    for d in range(num_days - 1):
+                        # PA 模式: Day d 為 P 且 Day d+1 為 A (高優先順序連續班次)
+                        is_pa = model.NewBoolVar(f"pa_{nid}_{d}")
+                        p_d = shift_assigned(nid, d, 'P')
+                        a_d1 = shift_assigned(nid, d + 1, 'A')
+                        model.Add(is_pa <= p_d)
+                        model.Add(is_pa <= a_d1)
+                        model.Add(is_pa >= p_d + a_d1 - 1)
+                        pa_rewards.append(is_pa)
+                        
+                    for d in range(num_days - 2):
+                        # PAN 模式: Day d 為 P, Day d+1 為 A, Day d+2 為 N (接續 N->O 自然循環)
+                        is_pan = model.NewBoolVar(f"pan_{nid}_{d}")
+                        p_d = shift_assigned(nid, d, 'P')
+                        a_d1 = shift_assigned(nid, d + 1, 'A')
+                        n_d2 = shift_assigned(nid, d + 2, 'N')
+                        model.Add(is_pan <= p_d)
+                        model.Add(is_pan <= a_d1)
+                        model.Add(is_pan <= n_d2)
+                        model.Add(is_pan >= p_d + a_d1 + n_d2 - 2)
+                        pan_rewards.append(is_pan)
+                        
+                        # PAO 模式: Day d 為 P, Day d+1 為 A, Day d+2 為 O
+                        is_pao = model.NewBoolVar(f"pao_{nid}_{d}")
+                        o_d2 = x[nid, d + 2, 'O', 'None']
+                        model.Add(is_pao <= p_d)
+                        model.Add(is_pao <= a_d1)
+                        model.Add(is_pao <= o_d2)
+                        model.Add(is_pao >= p_d + a_d1 + o_d2 - 2)
+                        pao_rewards.append(is_pao)
+                        
+                        # AAA 懲罰: 避免連續 3 天相同早班 AAA
+                        is_aaa = model.NewBoolVar(f"aaa_{nid}_{d}")
+                        a_d = shift_assigned(nid, d, 'A')
+                        a_d2 = shift_assigned(nid, d + 2, 'A')
+                        model.Add(is_aaa <= a_d)
+                        model.Add(is_aaa <= a_d1)
+                        model.Add(is_aaa <= a_d2)
+                        model.Add(is_aaa >= a_d + a_d1 + a_d2 - 2)
+                        aaa_penalties.append(is_aaa)
+                        
+                        # PPP 懲罰: 避免連續 3 天相同午班 PPP
+                        is_ppp = model.NewBoolVar(f"ppp_{nid}_{d}")
+                        p_d1 = shift_assigned(nid, d + 1, 'P')
+                        p_d2 = shift_assigned(nid, d + 2, 'P')
+                        model.Add(is_ppp <= p_d)
+                        model.Add(is_ppp <= p_d1)
+                        model.Add(is_ppp <= p_d2)
+                        model.Add(is_ppp >= p_d + p_d1 + p_d2 - 2)
+                        ppp_penalties.append(is_ppp)
+
+                    for d in range(num_days - 3):
+                        # PAPA 模式: Day d: P, d+1: A, d+2: P, d+3: A
+                        is_papa = model.NewBoolVar(f"papa_{nid}_{d}")
+                        p_d = shift_assigned(nid, d, 'P')
+                        a_d1 = shift_assigned(nid, d + 1, 'A')
+                        p_d2 = shift_assigned(nid, d + 2, 'P')
+                        a_d3 = shift_assigned(nid, d + 3, 'A')
+                        model.Add(is_papa <= p_d)
+                        model.Add(is_papa <= a_d1)
+                        model.Add(is_papa <= p_d2)
+                        model.Add(is_papa <= a_d3)
+                        model.Add(is_papa >= p_d + a_d1 + p_d2 + a_d3 - 3)
+                        papa_rewards.append(is_papa)
+
+                # 9. 套用已批准之單日申請 (支援任意 A, P, N, O, Day 組合之想返 / 避開)
                 for r in approved_reqs:
-                    if r.get("shift") != "LONG_NIGHT":
+                    s_code = r.get("shift", "")
+                    if s_code != "LONG_NIGHT":
                         n_match = next((n for n in DEFAULT_NURSES if n["name"] == r["name"]), None)
                         if n_match:
                             d_idx = int(r["day"]) - 1
-                            s_code = r["shift"]
-                            if s_code == "WANT_O":
-                                model.Add(x[n_match['id'], d_idx, 'O', 'None'] == 1)
-                            elif s_code == "WANT_A":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 1)
-                            elif s_code == "WANT_P":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 1)
-                            elif s_code == "WANT_N":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 1)
-                            elif s_code == "WANT_DAY":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 1)
-                            elif s_code == "WANT_AP":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') + shift_assigned(n_match['id'], d_idx, 'P') == 1)
-                            elif s_code == "AVOID_N":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'N') == 0)
-                            elif s_code == "AVOID_A":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'A') == 0)
-                            elif s_code == "AVOID_P":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'P') == 0)
-                            elif s_code == "AVOID_DAY":
-                                model.Add(shift_assigned(n_match['id'], d_idx, 'Day') == 0)
+                            intent, req_shifts = parse_shift_request(s_code)
+                            
+                            chosen_vars = []
+                            for s in req_shifts:
+                                if s == 'O':
+                                    chosen_vars.append(x[n_match['id'], d_idx, 'O', 'None'])
+                                elif s in ('A', 'P', 'N', 'Day'):
+                                    chosen_vars.append(shift_assigned(n_match['id'], d_idx, s))
+                            
+                            if chosen_vars:
+                                if intent == "WANT":
+                                    # 當天必須排在所選組合中的其中一個班別 (例如 A 或 P, 或 A 或 O)
+                                    model.Add(sum(chosen_vars) == 1)
+                                elif intent == "AVOID":
+                                    # 當天絕不可排所選組合中的任何班別 (例如 避開 N)
+                                    for v in chosen_vars:
+                                        model.Add(v == 0)
 
-                # 目標評分
+                # 目標評分 (整合連續順暢班別獎勵與相同連班懲罰)
                 scores = [
                     -50 * sum(off_penalties),
                     -10 * sum(weekly_hour_penalties),
                     -60 * sum(night_per_week_penalties),
                     -30 * sum(night_fairness_penalties),
                     -40 * sum(isolated_off_penalties),
-                    30 * sum(oo_rewards)
+                    30 * sum(oo_rewards),
+                    25 * sum(pa_rewards),
+                    50 * sum(pan_rewards),
+                    35 * sum(pao_rewards),
+                    40 * sum(papa_rewards),
+                    -80 * sum(aaa_penalties),
+                    -80 * sum(ppp_penalties)
                 ]
                 for n in DEFAULT_NURSES:
                     for d in days:
@@ -736,6 +972,13 @@ elif selected_user == "Admin (Ward Manager)":
 
                 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     st.success("✅ 班表已成功生成！ (Duty schedule successfully generated!)")
+                    pa_cnt = sum(solver.Value(v) for v in pa_rewards)
+                    pan_cnt = sum(solver.Value(v) for v in pan_rewards)
+                    pao_cnt = sum(solver.Value(v) for v in pao_rewards)
+                    papa_cnt = sum(solver.Value(v) for v in papa_rewards)
+                    aaa_cnt = sum(solver.Value(v) for v in aaa_penalties)
+                    ppp_cnt = sum(solver.Value(v) for v in ppp_penalties)
+                    st.info(f"✨ **排班人體工學模式統計**：PA 順暢接更 **{pa_cnt}** 次 | PAN 優質接更 **{pan_cnt}** 次 | PAO 連更接假 **{pao_cnt}** 次 | PAPA 規律輪替 **{papa_cnt}** 次 | 連續相同班別 (AAA / PPP) 成功壓減至 **{aaa_cnt} / {ppp_cnt}** 次。")
                     
                     # 建立格式化 Excel 檔案
                     wb = openpyxl.Workbook()
@@ -1019,3 +1262,4 @@ elif selected_user == "Admin (Ward Manager)":
                     mime="text/csv",
                     key="btn_dl_day_csv"
                 )
+
