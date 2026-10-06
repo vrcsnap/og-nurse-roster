@@ -1,6 +1,8 @@
 import streamlit as st
 import datetime
 import calendar
+import os
+import json
 import pandas as pd
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -16,6 +18,10 @@ MON, TUE, WED, THU, FRI, SAT, SUN = 0, 1, 2, 3, 4, 5, 6
 HANDOVER_DAYS = (MON, TUE, THU)
 SPECIAL_DAYS = (TUE, WED, FRI)
 WEEKEND_DAYS = (SAT, SUN)
+
+# 持久化檔案路徑 (Persistent Storage Files)
+REQUESTS_DB_FILE = "requests_db.csv"
+SAVED_SCHEDULE_FILE = "saved_schedule.json"
 
 DEFAULT_NURSES = [
     {"id": 1, "name": "Wong Choi Yu", "cap": "C(OTIC)"},
@@ -77,15 +83,78 @@ ADMIN_SHIFT_OPTIONS = {
     "不想返日間常規班 (No Day)": "AVOID_DAY"
 }
 
-# 初始化 Session 狀態
+# ==========================================
+# 試算表數據庫持久化讀寫函式 (Persistent Storage Handlers)
+# ==========================================
+def load_requests_from_db():
+    if os.path.exists(REQUESTS_DB_FILE):
+        try:
+            df = pd.read_csv(REQUESTS_DB_FILE, encoding="utf-8-sig")
+            df["reason"] = df["reason"].fillna("")
+            df["status"] = df["status"].fillna("待審核")
+            if "admin_created" not in df.columns:
+                df["admin_created"] = False
+            else:
+                df["admin_created"] = df["admin_created"].fillna(False).astype(bool)
+            if "end_day" not in df.columns:
+                df["end_day"] = df["day"]
+            else:
+                df["end_day"] = df["end_day"].fillna(df["day"]).astype(int)
+            df["day"] = df["day"].astype(int)
+            df["month"] = df["month"].astype(int)
+            df["year"] = df["year"].astype(int)
+            return df.to_dict("records")
+        except Exception as e:
+            st.warning(f"讀取申請試算表時發生錯誤：{e}")
+            return []
+    return []
+
+def save_requests_to_db(reqs):
+    cols = ["timestamp", "name", "year", "month", "day", "end_day", "shift", "shift_label", "reason", "status", "admin_created"]
+    if not reqs:
+        df = pd.DataFrame(columns=cols)
+    else:
+        df = pd.DataFrame(reqs)
+        for c in cols:
+            if c not in df.columns:
+                df[c] = False if c == "admin_created" else ("" if c == "reason" else df.get("day", 1))
+        df = df[cols]
+    df.to_csv(REQUESTS_DB_FILE, index=False, encoding="utf-8-sig")
+
+def load_saved_schedule():
+    if os.path.exists(SAVED_SCHEDULE_FILE):
+        try:
+            with open(SAVED_SCHEDULE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            df_sched = pd.DataFrame(data["df_out"])
+            daily_details = {int(k): v for k, v in data["daily_details"].items()}
+            meta = data["plan_meta"]
+            return df_sched, daily_details, meta
+        except Exception:
+            return None, None, None
+    return None, None, None
+
+def save_schedule_to_db(df_out, daily_details, plan_meta):
+    try:
+        data = {
+            "df_out": df_out.to_dict("records"),
+            "daily_details": {str(k): v for k, v in daily_details.items()},
+            "plan_meta": plan_meta
+        }
+        with open(SAVED_SCHEDULE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        st.error(f"儲存班表至持久化記憶體時發生錯誤：{e}")
+
+# 初始化 Session 狀態 (優先自持久化試算表/檔案讀取)
 if "requests_db" not in st.session_state:
-    st.session_state.requests_db = []
-if "generated_schedule" not in st.session_state:
-    st.session_state.generated_schedule = None
-if "daily_details" not in st.session_state:
-    st.session_state.daily_details = None
-if "plan_meta" not in st.session_state:
-    st.session_state.plan_meta = None
+    st.session_state.requests_db = load_requests_from_db()
+
+if "generated_schedule" not in st.session_state or st.session_state.generated_schedule is None:
+    loaded_df, loaded_dd, loaded_meta = load_saved_schedule()
+    st.session_state.generated_schedule = loaded_df
+    st.session_state.daily_details = loaded_dd
+    st.session_state.plan_meta = loaded_meta
 
 # ==========================================
 # 介面頂部: 直接於主頁面選擇身份
@@ -132,7 +201,7 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
     
     with tab1:
         st.subheader("15 號前登記下月特別更次 / 放假申請")
-        st.info("📌 規則提示：每週（星期一至日）最多申請 2 項；週末（星期六及日）最多只可申請 1 天例假 (Day Off)。若無特別偏好無須填寫。")
+        st.info("📌 規則提示：每週（星期一至日）最多申請 2 項；週末（星期六及日）最多只可申請 1 天例假 (Day Off)。申請將自動儲存於雲端資料庫，重整頁面不會丟失。")
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -166,13 +235,16 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
                     "year": req_year,
                     "month": req_month,
                     "day": int(req_day),
+                    "end_day": int(req_day),
                     "shift": shift_code,
                     "shift_label": selected_shift_label,
                     "reason": req_reason,
-                    "status": "待審核"
+                    "status": "待審核",
+                    "admin_created": False
                 }
                 st.session_state.requests_db.append(new_entry)
-                st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
+                save_requests_to_db(st.session_state.requests_db)
+                st.success(f"✅ 已成功登記並儲存至試算表：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
                 st.rerun()
             
         st.markdown("---")
@@ -189,10 +261,12 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
                 with col_r2:
                     if st.button("🗑️ 刪除", key=f"del_my_{idx}"):
                         st.session_state.requests_db.remove(r)
+                        save_requests_to_db(st.session_state.requests_db)
                         st.rerun()
                         
             if st.button("撤回我的所有申請"):
                 st.session_state.requests_db = [r for r in st.session_state.requests_db if r["name"] != selected_user]
+                save_requests_to_db(st.session_state.requests_db)
                 st.rerun()
         else:
             st.write("目前尚無申請記錄。")
@@ -293,6 +367,46 @@ elif selected_user == "Admin (Ward Manager)":
         _, max_day_admin = calendar.monthrange(plan_year, plan_month)
 
         # ----------------------------------------------------
+        # 記憶體與試算表數據庫管理面板 (Persistent Database & Spreadsheet Management)
+        # ----------------------------------------------------
+        with st.expander("💾 申請試算表數據庫管理 (Spreadsheet Database & Memory)", expanded=False):
+            st.markdown(f"本系統已啟用**持久化記憶功能**，所有護士及管理員申請均自動儲存於伺服器試算表檔案 (`{REQUESTS_DB_FILE}`) 中。")
+            st.write(f"目前試算表中共有 **{len(st.session_state.requests_db)}** 筆已儲存申請記錄。")
+            
+            col_db1, col_db2, col_db3 = st.columns(3)
+            with col_db1:
+                # 導出當前申請試算表
+                if st.session_state.requests_db:
+                    df_export_db = pd.DataFrame(st.session_state.requests_db)
+                    csv_export_db = df_export_db.to_csv(index=False).encode("utf-8-sig")
+                    st.download_button(
+                        label="📥 導出申請清單試算表 (CSV)",
+                        data=csv_export_db,
+                        file_name=f"Roster_Requests_Database_{datetime.date.today()}.csv",
+                        mime="text/csv",
+                        key="btn_dl_reqs_db"
+                    )
+            with col_db2:
+                # 上傳試算表備份還原
+                uploaded_db = st.file_uploader("📤 匯入申請試算表 (CSV)", type=["csv"], key="uploader_db_csv")
+                if uploaded_db is not None:
+                    try:
+                        df_uploaded = pd.read_csv(uploaded_db, encoding="utf-8-sig")
+                        st.session_state.requests_db = df_uploaded.to_dict("records")
+                        save_requests_to_db(st.session_state.requests_db)
+                        st.success(f"✅ 成功匯入並同步 {len(df_uploaded)} 筆申請！")
+                        st.rerun()
+                    except Exception as err:
+                        st.error(f"匯入失敗：{err}")
+            with col_db3:
+                # 清空試算表 (危險操作，防手滑)
+                if st.button("🗑️ 清空所有申請記錄", key="btn_clear_db"):
+                    st.session_state.requests_db = []
+                    save_requests_to_db([])
+                    st.warning("⚠️ 試算表申請記錄已全數清空！")
+                    st.rerun()
+
+        # ----------------------------------------------------
         # 管理員手動指派功能 (支援單日各更次及連續長夜班 Long Night)
         # ----------------------------------------------------
         with st.expander("➕ 管理員手動指派護士更次 / 連續長夜班 (Admin Manual Request & Long Night)", expanded=False):
@@ -337,7 +451,8 @@ elif selected_user == "Admin (Ward Manager)":
                     "admin_created": True
                 }
                 st.session_state.requests_db.append(new_adm_entry)
-                st.success(f"✅ 已成功加入管理員指派：{adm_target_nurse} — {label_disp}")
+                save_requests_to_db(st.session_state.requests_db)
+                st.success(f"✅ 已成功加入並儲存管理員指派：{adm_target_nurse} — {label_disp}")
                 st.rerun()
 
         # ----------------------------------------------------
@@ -368,6 +483,7 @@ elif selected_user == "Admin (Ward Manager)":
                 with col_c:
                     if st.button("刪除", key=f"adm_del_{idx}"):
                         st.session_state.requests_db.remove(r)
+                        save_requests_to_db(st.session_state.requests_db)
                         st.rerun()
         else:
             st.info("該月份目前暫無任何護士登記申請或管理員指定更次。")
@@ -507,7 +623,6 @@ elif selected_user == "Admin (Ward Manager)":
                     ln_days = long_nights.get(n['id'], set())
                     for d in days:
                         if d > 0:
-                            # 連續長夜期間，允許 N 接 N；非連續長夜期間，N 前一天必為 A
                             if d in ln_days and (d - 1) in ln_days:
                                 pass
                             elif d in ln_days:
@@ -515,7 +630,6 @@ elif selected_user == "Admin (Ward Manager)":
                             else:
                                 model.Add(shift_assigned(n['id'], d, 'N') <= shift_assigned(n['id'], d - 1, 'A'))
                             
-                            # 出夜必定為 O (除非後一天仍在長夜期間)
                             if (d - 1) in ln_days and d in ln_days:
                                 pass
                             else:
@@ -528,7 +642,6 @@ elif selected_user == "Admin (Ward Manager)":
                 # 7. 人手配置
                 for d in days:
                     w = (first_weekday + d) % 7
-                    # 夜更 (N更) 全組 6 人 (1 APN LWIC + 1 OTIC + 1 Scrub + 2 Room護士)
                     model.Add(sum(x[n['id'], d, 'N', 'OTIC'] for n in DEFAULT_NURSES) == 1)
                     model.Add(sum(x[n['id'], d, 'N', 'Scrub'] for n in DEFAULT_NURSES) == 1)
                     model.Add(sum(x[n['id'], d, 'N', 'Room'] for n in DEFAULT_NURSES) >= 2)
@@ -785,10 +898,11 @@ elif selected_user == "Admin (Ward Manager)":
                     st.session_state.daily_details = daily_details_dict
                     st.session_state.plan_meta = {"year": plan_year, "month": plan_month, "first_weekday": first_weekday, "num_days": num_days}
                     
-                    # 儲存 Excel
+                    # 儲存 Excel 與持久化檔案
                     output = io.BytesIO()
                     wb.save(output)
                     st.session_state.excel_data = output.getvalue()
+                    save_schedule_to_db(df_out, daily_details_dict, st.session_state.plan_meta)
                     
                 else:
                     st.error("❌ 運算未能找到可行解，請檢查是否有過多護士請假或長夜安排衝突。")
@@ -871,7 +985,6 @@ elif selected_user == "Admin (Ward Manager)":
                     'O': '全日休假'
                 }
                 
-                # 計算當日各班別在勤人數統計
                 a_nurses = [r['name'] for r in day_records if r['shift'] == 'A']
                 p_nurses = [r['name'] for r in day_records if r['shift'] == 'P']
                 n_nurses = [r['name'] for r in day_records if r['shift'] == 'N']
@@ -898,7 +1011,6 @@ elif selected_user == "Admin (Ward Manager)":
                 df_day_inspect = pd.DataFrame(inspect_table)
                 st.dataframe(df_day_inspect, use_container_width=True)
                 
-                # 提供單日當值表 CSV 下載
                 csv_day = df_day_inspect.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
                     label=f"📥 下載 {meta['month']}月{selected_inspect_day}日 當日執勤人員詳情 (CSV)",
