@@ -251,7 +251,6 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
     
     with tab1:
         st.subheader("15 號前登記下月特別更次 / 放假申請")
-        st.info("📌 規則提示：每週（星期一至日）最多申請 2 項；週末（星期六及日）最多只可申請 1 天例假 (Day Off)。申請將自動儲存於雲端資料庫，重整頁面不會丟失。")
         
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -263,58 +262,20 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
         with col3:
             _, max_day = calendar.monthrange(req_year, req_month)
             req_day = st.selectbox("日期 (Date)", list(range(1, max_day + 1)), index=0, key="n_da")
-            
-        st.markdown("#### 📋 護士特別班別申請引導流程 (Step-by-Step Shift Request)")
-        st.info("📌 操作指引：\n• Step 1：選擇意向（想返/想放 或 不想返/避開）。\n• Step 2：選擇班別（A、P、N、O、Day）。\n• 想要多個班別組合（如 A 或 P），可點擊「➕ 加入組合」重複 Step 1 與 Step 2；確定後點擊「✅ 提交此日申請」。\n• 您可更換上方日期重複 Step 1 與 Step 2 登記其他天，直到沒有更多申請為止 (Until no more requests)。")
-        
-        if "n_builder_shifts" not in st.session_state:
-            st.session_state.n_builder_shifts = []
-
-        # 快捷預設 (Quick Shortcut Presets)
-        st.caption("⚡ 常用快捷預設（點擊後直接帶入組合，亦可依下方 Step 1 & Step 2 自行組合）：")
-        b1, b2, b3, b4, b5, b6, b7 = st.columns(7)
-        with b1:
-            if st.button("A 班", key="btn_pre_a"):
-                st.session_state.n_builder_shifts = ["A"]
-                st.rerun()
-        with b2:
-            if st.button("P 班", key="btn_pre_p"):
-                st.session_state.n_builder_shifts = ["P"]
-                st.rerun()
-        with b3:
-            if st.button("N 班", key="btn_pre_n"):
-                st.session_state.n_builder_shifts = ["N"]
-                st.rerun()
-        with b4:
-            if st.button("放假 O", key="btn_pre_o"):
-                st.session_state.n_builder_shifts = ["O"]
-                st.rerun()
-        with b5:
-            if st.button("A 或 P", key="btn_pre_ap"):
-                st.session_state.n_builder_shifts = ["A", "P"]
-                st.rerun()
-        with b6:
-            if st.button("A 或 O", key="btn_pre_ao"):
-                st.session_state.n_builder_shifts = ["A", "O"]
-                st.rerun()
-        with b7:
-            if st.button("A/P/O", key="btn_pre_apo"):
-                st.session_state.n_builder_shifts = ["A", "P", "O"]
-                st.rerun()
 
         st.markdown("---")
 
-        # Step 1: 選擇意向 (Select 'Want' or 'Don't Want')
+        # Step 1: 選擇申請意向
         req_intent_val = st.radio(
-            "👉 **Step 1：選擇申請意向 (Select 'Want' or 'Don't Want')**",
-            ("🟢 想返 / 想放 (Want - 當天必須排入所選班別之一)", "🔴 不想返 / 避開 (Don't Want - 當天絕不排入所選班別)"),
+            "👉 **Step 1：選擇申請意向**",
+            ("🟢 想返 / 想放", "🔴 不想返 / 避開"),
             horizontal=True,
             key="n_step1_intent"
         )
         is_want = req_intent_val.startswith("🟢")
         current_intent = "WANT" if is_want else "AVOID"
 
-        # Step 2: 選擇班別 (Select Shift)
+        # Step 2: 選擇班別 (多選，一站式選取)
         shift_choices = ("A", "P", "N", "O", "Day")
         shift_desc = {
             "A": "A (早班 07:30-15:30)",
@@ -324,90 +285,75 @@ if selected_user not in ("請選擇您的身份...", "Admin (Ward Manager)"):
             "Day": "Day (日間常規班 09:00-17:00)"
         }
         
-        step2_shift = st.radio(
-            "👉 **Step 2：選擇班別 (Select Shift: A, P, N, O, Day)**",
-            shift_choices,
+        selected_shifts = st.multiselect(
+            "👉 **Step 2：選擇班別**",
+            options=shift_choices,
+            default=["A"],
             format_func=lambda s: shift_desc.get(s, s),
-            horizontal=True,
-            key="n_step2_shift"
+            key="n_step2_shifts"
         )
 
-        # 重複 Step 1 & 2 加入組合 / 清除
-        col_act1, col_act2 = st.columns((2, 1))
-        with col_act1:
-            btn_add_combo = st.button(f"➕ 加入【{step2_shift}】至當日組合 (And... 重複 Step 1 & 2 選擇更多班別)", key="btn_add_combo_step")
-        with col_act2:
-            btn_clear_combo = st.button("🔄 清除暫存班別 (Clear)", key="btn_clear_combo_step")
-
-        if btn_add_combo:
-            if step2_shift not in st.session_state.n_builder_shifts:
-                st.session_state.n_builder_shifts.append(step2_shift)
-                st.rerun()
+        if not selected_shifts:
+            st.warning("⚠️ 請至少選擇一個班別！")
+            shift_code = ""
+            selected_shift_label = ""
+        else:
+            combo_label_str = " 或 ".join(selected_shifts) if is_want else " 及 ".join(selected_shifts)
+            st.markdown(f"**申請意願**：`{combo_label_str}`")
+            
+            intent_type = "WANT" if is_want else "AVOID"
+            shift_code = f"{intent_type}:{'/'.join(selected_shifts)}"
+            
+            if is_want:
+                selected_shift_label = f"🟢 想返/放：{' 或 '.join(selected_shifts)}"
             else:
-                st.toast(f"班別 {step2_shift} 已在當日組合清單中！")
+                selected_shift_label = f"🔴 不想返：{' 及 '.join(selected_shifts)}"
 
-        if btn_clear_combo:
-            st.session_state.n_builder_shifts = []
+        req_reason = st.text_input("備註原因 (選填)：", "", key="n_req_rsn")
+
+        # 操作按鈕：加入 / 清除
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            btn_add = st.button("加入", key="btn_add_req")
+        with col_btn2:
+            btn_clear = st.button("清除", key="btn_clear_req")
+
+        if btn_clear:
+            st.session_state["n_step2_shifts"] = ["A"]
+            st.session_state["n_req_rsn"] = ""
             st.rerun()
 
-        # 決定當前要提交的班別組合 (Active Shifts)
-        if st.session_state.n_builder_shifts:
-            active_shifts = list(st.session_state.n_builder_shifts)
-        else:
-            active_shifts = [step2_shift]
-
-        # 顯示當前已累積之組合標籤
-        if len(active_shifts) > 1 or st.session_state.n_builder_shifts:
-            combo_label_str = " 或 ".join(active_shifts) if is_want else " 及 ".join(active_shifts)
-            st.markdown(f"🔗 **已組裝之班別組合**：`{combo_label_str}`")
-
-        # 即時意願確認預覽卡片
-        if is_want:
-            shift_code = f"WANT:{'/'.join(active_shifts)}"
-            selected_shift_label = f"🟢 想返/放：{' 或 '.join(active_shifts)}"
-            st.success(f"📋 **申請意願確認**：{req_year}年{req_month}月{req_day}日【必須排入】**{' 或 '.join(active_shifts)}** 其中之一（彈性指派，不排其他班別）。")
-        else:
-            shift_code = f"AVOID:{'/'.join(active_shifts)}"
-            selected_shift_label = f"🔴 不想返：{' 及 '.join(active_shifts)}"
-            st.error(f"📋 **申請意願確認**：{req_year}年{req_month}月{req_day}日【避開】**{' 及 '.join(active_shifts)}**（當天絕不可排這些班別）。")
-
-        req_reason = st.text_input("備註原因 (選填)：", "", key="n_step_reason")
-
-        # 提交此日申請
-        col_sub1, col_sub2 = st.columns((2, 1))
-        with col_sub1:
-            btn_submit = st.button("✅ 確認提交此項申請 (Confirm & Submit Request)", key="btn_sub_step")
-
-        if btn_submit:
-            is_valid, err_msg = validate_nurse_request(st.session_state.requests_db, selected_user, req_year, req_month, int(req_day), shift_code)
-            if not is_valid:
-                st.error(f"❌ 登記失敗：{err_msg}")
+        if btn_add:
+            if not selected_shifts:
+                st.error("❌ 請至少選擇一個班別！")
             else:
-                # 移除同一天的舊申請 (如果存在)
-                st.session_state.requests_db = [
-                    r for r in st.session_state.requests_db
-                    if not (r["name"] == selected_user and r["year"] == req_year and r["month"] == req_month and r["day"] == int(req_day))
-                ]
-                new_entry = {
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "name": selected_user,
-                    "year": req_year,
-                    "month": req_month,
-                    "day": int(req_day),
-                    "end_day": int(req_day),
-                    "shift": shift_code,
-                    "shift_label": selected_shift_label,
-                    "reason": req_reason,
-                    "status": "待審核",
-                    "admin_created": False
-                }
-                st.session_state.requests_db.append(new_entry)
-                save_requests_to_db(st.session_state.requests_db)
-                st.session_state.n_builder_shifts = []
-                st.success(f"✅ 已成功登記並儲存至試算表：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
-                st.info("💡 登記已完成！您可更改上方日期，繼續重複 Step 1 與 Step 2 提交更多申請；若無更多申請，即已完成！")
-                st.rerun()
-            
+                is_valid, err_msg = validate_nurse_request(st.session_state.requests_db, selected_user, req_year, req_month, int(req_day), shift_code)
+                if not is_valid:
+                    st.error(f"❌ 登記失敗：{err_msg}")
+                else:
+                    # 移除同一天的舊申請 (如果存在)
+                    st.session_state.requests_db = [
+                        r for r in st.session_state.requests_db
+                        if not (r["name"] == selected_user and r["year"] == req_year and r["month"] == req_month and r["day"] == int(req_day))
+                    ]
+                    new_entry = {
+                        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "name": selected_user,
+                        "year": req_year,
+                        "month": req_month,
+                        "day": int(req_day),
+                        "end_day": int(req_day),
+                        "shift": shift_code,
+                        "shift_label": selected_shift_label,
+                        "reason": req_reason,
+                        "status": "待審核",
+                        "admin_created": False
+                    }
+                    st.session_state.requests_db.append(new_entry)
+                    save_requests_to_db(st.session_state.requests_db)
+                    st.success(f"✅ 已成功登記：{req_year}年{req_month}月{req_day}日 — {selected_shift_label}！")
+                    st.rerun()
+        
         st.markdown("---")
         st.subheader("您已提交的申請記錄：")
         my_reqs = [r for r in st.session_state.requests_db if r["name"] == selected_user]
